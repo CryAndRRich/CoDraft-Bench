@@ -208,6 +208,7 @@ def get_stats(df, fig_prefix="confusion_matrix", return_metrics=False):
     plt.savefig(f'{fig_prefix}.png', format='png', dpi=300, bbox_inches='tight')
 
     plt.show()
+    plt.close()
 
     if return_metrics:
         err = np.abs(y_true - y_pred)

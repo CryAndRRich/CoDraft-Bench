@@ -321,6 +321,15 @@ def _gpu_count():
         return 0
 
 
+_PRINT_LOCK = threading.Lock()
+
+
+def _say(text):
+    # Two runs stream at once; without the lock their lines interleave mid-line.
+    with _PRINT_LOCK:
+        print(text, flush=True)
+
+
 def _stream(proc, prefix, log_path, progress_every=60):
     """Echo a child's output with a prefix. Progress-bar redraws (\\r) are throttled so the
     notebook output stays readable; the log file keeps everything."""
@@ -337,13 +346,13 @@ def _stream(proc, prefix, log_path, progress_every=60):
                 if not line:
                     continue
                 if ch == "\n" or time.time() - last > progress_every:
-                    print(f"{prefix} {line}", flush=True)
+                    _say(f"{prefix} {line}")
                     if ch == "\r":
                         last = time.time()
             else:
                 buf += ch
         if buf.strip():
-            print(f"{prefix} {buf.strip()}", flush=True)
+            _say(f"{prefix} {buf.strip()}")
 
 
 def launch(run_ids, data_root=None, out_root=".", seed=DEFAULT_SEED, smoke=False,
@@ -404,8 +413,55 @@ def launch(run_ids, data_root=None, out_root=".", seed=DEFAULT_SEED, smoke=False
         time.sleep(2)
 
     summary(out_root, smoke=smoke)
+    tags = [("SMOKE_" if smoke else "") + f"{rid:02d}_{RUNS[rid]['name']}_seed{seed}" for rid in ids]
+    package(tags, out_root, include_weights=save_weights)
     if failed:
         raise RuntimeError(f"runs failed: {failed}. Full output is in {log_dir}/")
+
+
+def package(tags, out_root=".", include_weights=True):
+    """Put everything a session produced into one zip, so a Kaggle run is one download.
+
+    Holds results/, logs/ and weights/ for the given tags. Weights are stored rather than
+    compressed (safetensors do not shrink and deflating 2 GB is slow), and once the zip is
+    verified the loose weight folders are removed so /kaggle/working is not holding every
+    checkpoint twice. Runs that did not finish are skipped; their logs are still included.
+    """
+    import zipfile
+    files = []
+    for tag in tags:
+        files += glob.glob(os.path.join(out_root, "results", f"{tag}_*"))
+        files += glob.glob(os.path.join(out_root, "results", f"cm_{tag}.*"))
+        files += glob.glob(os.path.join(out_root, "logs", f"{tag}.log"))
+        if include_weights:
+            for root, _, fs in os.walk(os.path.join(out_root, "weights", tag)):
+                files += [os.path.join(root, f) for f in fs]
+    if not files:
+        print("nothing to package")
+        return None
+
+    ids = "-".join(t.split("_")[1 if t.startswith("SMOKE_") else 0] for t in tags)
+    name = ("SMOKE_" if tags[0].startswith("SMOKE_") else "") + f"codraft_runs_{ids}.zip"
+    path = os.path.join(out_root, name)
+    with zipfile.ZipFile(path, "w", allowZip64=True) as zf:
+        for f in sorted(set(files)):
+            heavy = os.sep + "weights" + os.sep in f
+            zf.write(f, os.path.relpath(f, out_root),
+                     compress_type=zipfile.ZIP_STORED if heavy else zipfile.ZIP_DEFLATED)
+    with zipfile.ZipFile(path) as zf:
+        bad = zf.testzip()
+        n = len(zf.namelist())
+    if bad is not None:
+        print(f"!! zip check failed on {bad}; loose files kept")
+        return path
+
+    if include_weights:
+        import shutil
+        for tag in tags:
+            shutil.rmtree(os.path.join(out_root, "weights", tag), ignore_errors=True)
+    print(f"\npackaged {n} files -> {path} ({os.path.getsize(path) / 2**20:.1f} MB)")
+    print("download this one file from the Output panel")
+    return path
 
 
 def summary(out_root=".", smoke=False):
