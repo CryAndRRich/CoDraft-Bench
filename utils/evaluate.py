@@ -1,26 +1,36 @@
-import numpy as np
-from sklearn.metrics import cohen_kappa_score
-import matplotlib.pyplot as plt
-import seaborn as sns
+import os
 import shutil
 
-import os
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 import torch
-from tqdm.auto import tqdm
 import torch.nn.functional as F
-from sklearn.metrics import accuracy_score, f1_score, cohen_kappa_score, mean_absolute_error
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+from sklearn.metrics import accuracy_score, f1_score, cohen_kappa_score, mean_absolute_error
 
 from model.models.BiEncoder import get_model_bi_encoder_baseline, BasicBiEncoderClassifier
-from preprocess.data_loader import PairSiameseDataset
+from preprocess.data_loader import PairSiameseDataset, collate_siamese
 
 from config import *
+
 def get_preds_ml(model, X_test, y_test):
     test_preds = model.predict(X_test)
     return (test_preds, y_test)
 
-def get_preds_multi(trainer, test_ds, df_test):
+def get_preds_multi(trainer, test_ds, df_test, save_logits=None, return_logits=False):
+    """Predict with the multi-task model.
+
+    create_patterns duplicates every row (one copy masks side 1, one masks side 2),
+    so the logits are reshaped to (-1, 2, 5) and averaged. This requires the test
+    order to be preserved, i.e. no shuffling.
+
+    save_logits: path to write the averaged logits to (.npy). Saving them means the
+    calibration and risk-coverage analyses can be run later without re-predicting.
+    return_logits: append avg_logits to the returned tuple.
+    """
     test_output = trainer.predict(test_ds)
     predictions = test_output.predictions
 
@@ -30,9 +40,43 @@ def get_preds_multi(trainer, test_ds, df_test):
     reshaped_logits = predictions.reshape(-1, 2, 5)
     avg_logits = reshaped_logits.mean(axis=1)
 
+    if len(predictions) != 2 * len(df_test):
+        raise ValueError(
+            f"got {len(predictions)} prediction rows for {len(df_test)} test pairs; "
+            f"expected exactly twice that, since create_patterns writes two masked "
+            f"copies of every pair. A shuffled or padded eval loader breaks the "
+            f"pairing that the (-1, 2, 5) reshape relies on."
+        )
+    if len(avg_logits) != len(df_test):
+        raise ValueError(
+            f"averaged logits ({len(avg_logits)}) do not line up with df_test "
+            f"({len(df_test)}); the test order was probably not preserved"
+        )
+
     test_preds = np.argmax(avg_logits, axis=-1)
     test_true = df_test["label_score"].values
+
+    if save_logits is not None:
+        os.makedirs(os.path.dirname(save_logits) or ".", exist_ok=True)
+        np.save(save_logits, avg_logits)
+
+    if return_logits:
+        return (test_preds, test_true, avg_logits)
     return (test_preds, test_true)
+
+
+def build_result_df(df_test, test_true, test_preds):
+    """Prediction frame that carries Pair ID when the split provides one.
+
+    Without an identifier two runs cannot be compared pair by pair, which is why
+    the first round's two ablation files could not be matched up.
+    """
+    out = {"label": test_true, "pred": test_preds}
+    for key in ("Pair ID", "Class 1", "Class 2"):
+        if key in df_test.columns:
+            out[key] = df_test[key].values
+    cols = [c for c in ("Pair ID", "label", "pred", "Class 1", "Class 2") if c in out]
+    return pd.DataFrame(out)[cols]
 def get_preds_cross_encoder(model, df_test):
     test_inputs = [
         [str(row['input_text_1']), str(row['input_text_2'])]
@@ -49,6 +93,13 @@ def get_preds_siamese(test_df, model_path,model_name, device):
 
 
 def compute_metrics(eval_pred):
+    """Validation metrics during training.
+
+    Note these are computed per augmented row. create_patterns makes two masked copies
+    of every pair, and unlike get_preds_multi this does not average them back together,
+    so the validation figures sit slightly below the final test figures. Kept as-is
+    because it is only used to pick the best checkpoint.
+    """
     logits, labels = eval_pred
 
     if isinstance(labels, tuple):
@@ -71,7 +122,14 @@ def compute_metrics(eval_pred):
 def safe_div(a, b):
     return float(a) / float(b) if b else 0.0
 
-def get_stats(df):
+def get_stats(df, fig_prefix="confusion_matrix", return_metrics=False):
+    """Per-class and overall metrics for a (label, pred) frame.
+
+    fig_prefix: figure stem, so each run writes its own file instead of
+    overwriting the previous one.
+    return_metrics: return every metric as a dict, including the macro-F1 and the
+    per-class table, which used to be printed and then discarded.
+    """
     y_true = df["label"].to_numpy()
     y_pred = df["pred"].to_numpy()
 
@@ -145,11 +203,28 @@ def get_stats(df):
                 xticklabels=label_names,
                 yticklabels=label_names)
 
-    plt.savefig('confusion_matrix.pdf', format='pdf', bbox_inches='tight')
+    plt.savefig(f'{fig_prefix}.pdf', format='pdf', bbox_inches='tight')
 
-    plt.savefig('confusion_matrix.png', format='png', dpi=300, bbox_inches='tight')
+    plt.savefig(f'{fig_prefix}.png', format='png', dpi=300, bbox_inches='tight')
 
     plt.show()
+
+    if return_metrics:
+        err = np.abs(y_true - y_pred)
+        return {
+            "n": int(len(y_true)),
+            "accuracy": overall_acc,
+            "mae": mae,
+            "qwk": qwk,
+            "f1_macro": macro_f1,
+            "precision_macro": macro_precision,
+            "recall_macro": macro_recall,
+            "f1_micro": micro_f1,
+            "adjacent_acc": float((err <= 1).mean()),
+            "severe_rate": float((err >= 2).mean()),
+            "per_class": per_class,
+            "confusion_matrix": cm,
+        }
     return overall_acc, mae, qwk
 
 
@@ -196,9 +271,10 @@ def _predict_probabilities(model_path,model_name, test_df, device):
     test_ds = PairSiameseDataset(test_df, tokenizer, max_len=CONFIG_MODEL.MAX_LEN) 
     
     test_loader = DataLoader(
-        test_ds, 
-        batch_size=CONFIG_MODEL.MODEL_CONFIG['siamese']['batch_size'], 
-        shuffle=False
+        test_ds,
+        batch_size=CONFIG_MODEL.MODEL_CONFIG['siamese']['batch_size'],
+        shuffle=False,
+        collate_fn=collate_siamese,
     )
     
     all_probs = []

@@ -69,13 +69,28 @@ def create_ml_data(train_df, val_df, test_df=None, max_features=5000):
         return X_train, y_train, X_val, y_val, X_test, y_test, vectorizer 
     return X_train, y_train, X_val, y_val, vectorizer
 
+def collate_siamese(batch):
+    """Stack a batch and cut the padding down to its longest real sequence.
+
+    PairSiameseDataset pads every item to MAX_LEN. The attention mask already hides the
+    padding, so trimming changes no output; it only stops a batch of seven-word product
+    names from costing 256 positions each, which is what ran a T4 out of memory.
+    """
+    out = {k: torch.stack([b[k] for b in batch]) for k in batch[0]}
+    for ids, mask in (("ids1", "mask1"), ("ids2", "mask2")):
+        n = int(out[mask].sum(dim=1).max())
+        out[ids] = out[ids][:, :n]
+        out[mask] = out[mask][:, :n]
+    return out
+
 def create_siamese_dataloader(train_df, val_df, tokenizer):
     train_ds = PairSiameseDataset(train_df, tokenizer, CONFIG_DATA.MAX_LEN)
     val_ds = PairSiameseDataset(val_df, tokenizer, CONFIG_DATA.MAX_LEN)
     train_loader = DataLoader(train_ds, batch_size=CONFIG_MODEL.MODEL_CONFIG['siamese']['physical_batch_size'], 
-                              shuffle=True, num_workers=CONFIG_MODEL.MODEL_CONFIG['siamese']['num_workers'], drop_last=True)
+                              shuffle=True, num_workers=CONFIG_MODEL.MODEL_CONFIG['siamese']['num_workers'], drop_last=True,
+                              collate_fn=collate_siamese)
     val_loader = DataLoader(val_ds, batch_size=CONFIG_MODEL.MODEL_CONFIG['siamese']['physical_batch_size'], 
-                            shuffle=False, num_workers=2)
+                            shuffle=False, num_workers=2, collate_fn=collate_siamese)
     return (train_loader, val_loader)
 
 def create_patterns(df, tokenizer, class_to_token, class_to_id):

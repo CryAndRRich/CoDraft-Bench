@@ -24,11 +24,26 @@ class DataManager:
                  random_seed: int,
                  tokenizer=None,
                  rebalance=False,
-                 train_file: str = "train_ver3.csv",
-                 val_file: str = "val_ver3.csv",
-                 test_file: str = "test_ver3.csv") -> None:
+                 variant: str = "codraft",
+                 build_for=None,
+                 train_file: str = "train.csv",
+                 val_file: str = "val.csv",
+                 test_file: str = "test.csv") -> None:
+        """
+        variant: which input the model sees -- a subfolder of input_root.
+            "codraft"  product name + LLM Nature/Purpose  (the full input)
+            "plain"    the bare product name              (the ablation input)
+            "expanded" the LLM-rewritten name
+        The three are row-aligned on Pair ID, so any two can be compared pair by pair.
+        Pass variant=None to read the files straight from input_root.
+
+        build_for: which pipelines to build -- "multi_task", "cross_encoder", "ml",
+            "siamese", or a list of them. None (the default) builds all four, which is
+            what the original did.
+        """
         
-        self.INPUT_ROOT = input_root
+        self.INPUT_ROOT = os.path.join(input_root, variant) if variant else input_root
+        self.variant = variant
         self.WORK_DIR = work_dir
         self.SEED_WORKER = seed_worker
         self.DATA_GENERATOR = data_generator
@@ -45,16 +60,36 @@ class DataManager:
         self._setup_initial_pipeline()
         if rebalance == True:
             self._rebalance()
-        self.__create_ml_data()
-        self.__create_dataset_multi_task(self.tokenizer)
-        self.__create_dataloader_cross_encoder()
-        self.__create_dataloader_siamese(self.tokenizer)
-        self._all_texts()
+
+        # Only build what the caller asked for. Building all four pipelines costs
+        # several minutes and most notebooks use one of them.
+        build = {"ml", "multi_task", "cross_encoder", "siamese"} if build_for is None \
+            else ({build_for} if isinstance(build_for, str) else set(build_for))
+        unknown = build - {"ml", "multi_task", "cross_encoder", "siamese"}
+        if unknown:
+            raise ValueError(f"unknown build_for entries: {sorted(unknown)}")
+
+        if "ml" in build:
+            self.__create_ml_data()
+        if "multi_task" in build:
+            self.__create_dataset_multi_task(self.tokenizer)
+        if "cross_encoder" in build:
+            self.__create_dataloader_cross_encoder()
+        if "siamese" in build:
+            self.__create_dataloader_siamese(self.tokenizer)
+            self._all_texts()
         
     def _load_raw_csv(self) -> None:
-            self.df_train = pd.read_csv(os.path.join(self.INPUT_ROOT, self.train_file))
-            self.df_val = pd.read_csv(os.path.join(self.INPUT_ROOT, self.val_file))
-            self.df_test = pd.read_csv(os.path.join(self.INPUT_ROOT, self.test_file))
+        if not os.path.isdir(self.INPUT_ROOT):
+            raise FileNotFoundError(
+                f"{self.INPUT_ROOT} does not exist. Expected <input_root>/<variant>/ "
+                f"with train.csv, val.csv and test.csv inside."
+            )
+        self.df_train = pd.read_csv(os.path.join(self.INPUT_ROOT, self.train_file), low_memory=False)
+        self.df_val = pd.read_csv(os.path.join(self.INPUT_ROOT, self.val_file), low_memory=False)
+        self.df_test = pd.read_csv(os.path.join(self.INPUT_ROOT, self.test_file), low_memory=False)
+        print(f"[{self.variant or self.INPUT_ROOT}] train={len(self.df_train)} "
+              f"val={len(self.df_val)} test={len(self.df_test)}")
     def _setup_initial_pipeline(self) -> None:
         all_classes = sorted(list(set(
             self.df_train["Class 1"].tolist() + self.df_train["Class 2"].tolist() +
@@ -62,9 +97,17 @@ class DataManager:
             self.df_test["Class 1"].tolist() + self.df_test["Class 2"].tolist()
         )))
 
-        self.class_to_token = {c: f"[CLASS_{c}]" for c in all_classes}
-        self.class_to_id = {c: i for i, c in enumerate(all_classes)}
-        self.NUM_PRODUCT_CLASSES = len(all_classes)
+        # NICE is a fixed taxonomy, so the mapping is fixed too: class c is token
+        # [CLASS_c] and auxiliary label c - 1. It used to be built from the classes that
+        # happened to appear in the data, which only matched the 45-way auxiliary head
+        # because the full dataset contains all 45.
+        nice = sorted(CONFIG_DATA.NICE_CLASS_MAP)
+        unknown = sorted(set(all_classes) - set(nice))
+        if unknown:
+            raise ValueError(f"classes outside the NICE map: {unknown}")
+        self.class_to_token = {c: f"[CLASS_{c}]" for c in nice}
+        self.class_to_id = {c: i for i, c in enumerate(nice)}
+        self.NUM_PRODUCT_CLASSES = len(nice)
         self._update_data()
     def _all_texts(self) -> None:
         self.all_texts = list(set(
@@ -142,4 +185,6 @@ class DataManager:
     def get_ml_data(self) -> Tuple:
         return (self.X_train, self.y_train, self.X_val, self.y_val, self.X_test, self.y_test)
     def get_all_texts(self) -> List:
+        if not hasattr(self, "all_texts"):
+            self._all_texts()
         return self.all_texts

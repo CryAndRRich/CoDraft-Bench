@@ -33,6 +33,12 @@ def preprocess(df):
     df = df.dropna(subset=['label_score'])
     df['label_score'] = df['label_score'].astype(int)
     
+    # The expanded variant carries the LLM-rewritten name instead of Nature/Purpose.
+    if 'Term 1 Expand' in df.columns and 'Term 2 Expand' in df.columns:
+        df['input_text_1'] = df['Term 1 Expand'].astype(str).str.strip()
+        df['input_text_2'] = df['Term 2 Expand'].astype(str).str.strip()
+        return df
+
     if 'Nature 1' in df.columns or 'Purpose 1' in df.columns:
         df['input_text_1'] = df.apply(
             lambda x: create_structured_text_enhanced(

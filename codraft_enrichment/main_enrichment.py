@@ -8,8 +8,8 @@ import openai
 import instructor
 
 from config.config_data import CONFIG_DATA
-from prompts import ENRICHMENT_PROMPTS
-from schemas import SCHEMA_MAP
+from .prompt import ENRICHMENT_PROMPTS
+from .schemas import SCHEMA_MAP
 
 def get_client(api_key):
     client = instructor.from_openai(

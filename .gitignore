@@ -1,0 +1,25 @@
+# Dataset — released separately, never committed
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Secrets: the enrichment pipeline reads an API key
+.env
+
+# Training artefacts
+output/
+working/
+weights/
+*.zip
+*.pt
+*.pth
+*.safetensors
+
+# Run outputs
+results/

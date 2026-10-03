@@ -22,13 +22,13 @@ class JointClassSimBGE(XLMRobertaPreTrainedModel):
         self.loss_type = getattr(config, "loss_type", "rank_aware")
         class_weights_tensor = getattr(config, "class_weights", None)
         if class_weights_tensor is not None:
-             self.register_buffer("class_weights", torch.tensor(class_weights_tensor, dtype=torch.float32))
+            self.register_buffer("class_weights", torch.tensor(class_weights_tensor, dtype=torch.float32))
+        else:
+            self.register_buffer("class_weights", None)
 
         self.roberta = XLMRobertaModel(config)
         self.classifier = nn.Linear(config.hidden_size, self.num_labels)
         self.aux_classifier = nn.Linear(config.hidden_size, self.num_product_classes)
-
-        self.register_buffer("class_weights", None)
 
         if getattr(config, "gradient_checkpointing", False):
             self.roberta.gradient_checkpointing = True
@@ -79,8 +79,12 @@ def get_training_args(**kwargs):
     training_args = TrainingArguments(**kwargs)
     return training_args
 
-def get_model_multi_task(model_name, num_classes, num_product_classes, alpha, aux_weight, device, loss_type="rank_aware",class_weights=None):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+def get_model_multi_task(model_name, num_classes, num_product_classes, alpha, aux_weight, device, loss_type="rank_aware",class_weights=None, tokenizer=None):
+    # Resize against the tokenizer the data was encoded with. This used to load a fresh
+    # tokenizer here, so the embedding matrix never grew to cover the class tokens.
+    if tokenizer is None:
+        from model.get_tokenizer import get_tokenizer
+        tokenizer = get_tokenizer(model_name, add_class_tokens=True)
     config = AutoConfig.from_pretrained(model_name)
     config.num_labels = num_classes
     config.num_product_classes = num_product_classes

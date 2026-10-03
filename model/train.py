@@ -1,4 +1,5 @@
 import gc
+import os
 
 import torch
 import torch.nn as nn
@@ -31,16 +32,24 @@ def train_svm(X_train, y_train):
     return model, vectorizer
 
 
-def train_bi_encoder_baseline(input_model_path, train_loader, val_loader, class_weights, output_path, device):    
+def train_bi_encoder_baseline(input_model_path, train_loader, val_loader, class_weights, output_path, device,
+                              epochs=None, gradient_checkpointing=True):
     model = get_model_bi_encoder_baseline(input_model_path, num_classes=CONFIG_MODEL.NUM_CLASSES)
     model.to(device)
+    if gradient_checkpointing:
+        # Memory only; the result is unchanged. Both sides of every pair go through the
+        # encoder, so activations are the bottleneck on a 16 GB card.
+        try:
+            model.encoder[0].auto_model.gradient_checkpointing_enable()
+        except Exception as e:
+            print(f"gradient checkpointing unavailable for this encoder: {e}")
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG_MODEL.MODEL_CONFIG['siamese']['lr'])
     weights_tensor = torch.tensor(class_weights, dtype=torch.float).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights_tensor)
     
     best_f1 = 0.0
-    num_epochs = CONFIG_MODEL.MODEL_CONFIG['siamese']['num_epochs_cls']
+    num_epochs = epochs if epochs is not None else CONFIG_MODEL.MODEL_CONFIG['siamese']['num_epochs_cls']
     
     for epoch in range(num_epochs):
         model.train()
@@ -95,19 +104,52 @@ def train_bi_encoder_baseline(input_model_path, train_loader, val_loader, class_
     gc.collect()
 
 
-def train_cross_encoder(model, train_dataloader, evaluator):
+def train_cross_encoder(model, train_dataloader, evaluator, output_path=None, epochs=None,
+                        gradient_checkpointing=True):
+    """Fine-tune a sentence-transformers CrossEncoder.
+
+    Three fixes against the round-1 version, all checked against sentence-transformers
+    3.0.1:
+    - CrossEncoder.fit() never reads model.loss_fct. With loss_fct=None it builds an
+      unweighted nn.CrossEntropyLoss(), so the class weights set in
+      get_model_cross_encoder were silently ignored. They are now passed explicitly.
+    - fit() saves the best checkpoint (by validation accuracy) to output_path but leaves
+      the model at its last epoch, and the old code predicted with that. The best
+      checkpoint is now reloaded.
+    - output_path was hardcoded, so every run overwrote the last.
+    gradient_checkpointing trades time for memory and leaves the result unchanged; without
+    it a 568M backbone at batch 32 in fp32 does not fit a 16 GB T4.
+    """
+    from sentence_transformers import CrossEncoder
+
+    if output_path is None:
+        output_path = CONFIG_MODEL.MODEL_CONFIG['cross_encoder']['output_path']
+    if epochs is None:
+        epochs = CONFIG_MODEL.MODEL_CONFIG['cross_encoder']['epochs']
+    if gradient_checkpointing:
+        model.model.gradient_checkpointing_enable()
+
     model.fit(
         train_dataloader=train_dataloader,
         evaluator=evaluator,
+        loss_fct=getattr(model, "loss_fct", None),
         save_best_model=True,
         optimizer_params={'lr': CONFIG_MODEL.LEARNING_RATE},
         weight_decay=CONFIG_MODEL.WEIGHT_DECAY,
-        epochs=CONFIG_MODEL.MODEL_CONFIG['cross_encoder']['epochs'],
+        epochs=epochs,
         warmup_steps=int(len(train_dataloader) * 0.1),
-        output_path='./output/nice_model_3prongs_strategy',
+        output_path=output_path,
         show_progress_bar=True,
         evaluation_steps=500
         )
+
+    if os.path.isfile(os.path.join(output_path, "config.json")):
+        best = model.best_score
+        print(f"reloading best checkpoint (val accuracy {best:.4f}) from {output_path}")
+        model = CrossEncoder(output_path, max_length=model.max_length)
+        model.best_score = best
+    else:
+        print("no checkpoint was saved; predicting with the last epoch")
     return model
 
 def train_multi_task(model, training_args, train_ds, val_ds, tokenizer, compute_metrics):

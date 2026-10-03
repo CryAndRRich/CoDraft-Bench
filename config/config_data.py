@@ -52,6 +52,13 @@ class CONFIG_DATA:
         45: "Legal services, Security services, Social services"
     }
 
+    # One dedicated token per NICE class. create_patterns prepends the class token of the
+    # unmasked side and [MASK] on the other, and the auxiliary head predicts the masked
+    # side's class from the [MASK] hidden state. These must be registered with the
+    # tokenizer (get_tokenizer(add_class_tokens=True)); otherwise SentencePiece splits
+    # "[CLASS_11]" into ordinary subwords and the resize below it does nothing.
+    CLASS_TOKENS = [f"[CLASS_{i}]" for i in range(1, 46)]
+
     CODRAFT_CONFIG = {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "batch_size": 30,
