@@ -199,10 +199,18 @@ def run_experiment(run_id, data_root=None, out_root=".", seed=DEFAULT_SEED, smok
     t0 = time.time()
 
     def data_manager(tokenizer, build_for):
-        return DataManager(input_root=data_root, work_dir=scratch, config_data=CONFIG_DATA,
-                           tokenizer=tokenizer, seed_worker=seed_worker,
-                           data_generator=generator, random_seed=seed, rebalance=False,
-                           variant=spec["variant"], build_for=build_for)
+        dm = DataManager(input_root=data_root, work_dir=scratch, config_data=CONFIG_DATA,
+                         tokenizer=tokenizer, seed_worker=seed_worker,
+                         data_generator=generator, random_seed=seed, rebalance=False,
+                         variant=spec["variant"], build_for=build_for)
+        # An empty cell that became the text "nan" trained run 13 on "Nature: nan | Use: nan";
+        # stop before training if any input still carries one.
+        for split, d in zip(("train", "val", "test"), dm.get_data()):
+            for c in ("input_text_1", "input_text_2"):
+                bad = d[c].astype(str).str.contains(r"(?:Nature|Use|Category): nan\b", regex=True)
+                assert not bad.any(), f"{split} {c}: {int(bad.sum())} inputs carry 'nan', e.g. {d[c][bad].iloc[0]!r}"
+        print("sample input:", dm.get_data()[2]["input_text_1"].iloc[0])
+        return dm
 
     extra = {}
     logits = None

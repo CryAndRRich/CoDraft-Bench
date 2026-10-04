@@ -15,6 +15,8 @@ Outputs under <out>/, all named after the LLM tag:
     attributes/<tag>_raw.jsonl         every answer as it arrived (resumes an interrupted run)
     attributes/<tag>_enrich.json       model revision, versions, prompt, coverage, tokens, time
     codraft_<tag>/{train,val,test}.csv the data variant, row-aligned with data/codraft/
+(run locally, the attribute file, its .json and the variant go into data/ instead, next to
+Gemini's: data/attributes/ and data/codraft_<tag>/; see data/README.md)
     results/llm_<tag>_<k>shot_<variant>_preds.csv / _metrics.json / cm_*.pdf/.png
         variant "plain" (the name only), "own" (codraft_<tag>: this LLM's own attributes)
         or any data variant, e.g. "codraft" (Gemini's attributes)
@@ -95,18 +97,21 @@ def enrich_task(client, spec, meta, data_root, out_root, scope, smoke, batch_siz
         keys = {(norm(t), int(c)) for side in "12" for t, c in zip(pick[f"Term {side}"], pick[f"Class {side}"])}
         table = table[[(k, c) in keys for k, c in zip(table["key"], table["Class"])]].reset_index(drop=True)
     print(f"enrichment: {len(table)} (term, class) pairs, scope={scope}")
-    attr_dir = os.path.join(out_root, "attributes")
-    attrs, st = enrich(client, table, attr_dir, tag, batch_size=batch_size, workers=workers)
+    # Locally the attributes and the variant go into data/, next to Gemini's (data/README.md).
+    # Kaggle's dataset is read-only, so there they go to the output; so do a smoke test's,
+    # anywhere. The raw answers stay in the output either way: they are for resuming.
+    in_data = not smoke and not os.path.abspath(data_root).startswith("/kaggle/input")
+    work_dir = os.path.join(out_root, "attributes")
+    attr_dir = os.path.join(data_root, "attributes") if in_data else work_dir
+    variant_root = data_root if in_data else out_root
+    attrs, st = enrich(client, table, work_dir, tag, batch_size=batch_size, workers=workers)
+    os.makedirs(attr_dir, exist_ok=True)
     path = os.path.join(attr_dir, f"{tag}_attributes.csv")
     attrs.drop(columns=["key", "returned_term"]).to_csv(path, index=False)
     print(f"attributes: {len(attrs)}/{len(table)} terms -> {path}; failed: {st['n_failed']}; "
           f"by mode: {st['by_mode']}; generic natures: {st['generic_nature']}")
     written = {}
-    # next to the shipped variants locally; on Kaggle the dataset is read-only, so in the output
-    variant_root = out_root if os.path.abspath(data_root).startswith("/kaggle/input") else data_root
     vname = ("SMOKE_" if smoke else "") + f"codraft_{spec['tag']}"
-    if smoke:
-        variant_root = out_root          # a 50-pair test file, never next to the real data
     try:
         written = build_variant(data_root, path, vname, out_root=variant_root,
                                 splits=("test",) if smoke else None, pair_ids=smoke_ids)
@@ -116,7 +121,7 @@ def enrich_task(client, spec, meta, data_root, out_root, scope, smoke, batch_siz
               "attributes": os.path.relpath(path, out_root), "variant_splits": written, **st}
     with open(os.path.join(attr_dir, f"{tag}_enrich.json"), "w") as fh:
         json.dump(record, fh, indent=2, default=str)
-    files = [path, os.path.join(attr_dir, f"{tag}_raw.jsonl"), os.path.join(attr_dir, f"{tag}_enrich.json")]
+    files = [path, os.path.join(work_dir, f"{tag}_raw.jsonl"), os.path.join(attr_dir, f"{tag}_enrich.json")]
     files += glob.glob(os.path.join(variant_root, vname, "*.csv")) if written else []
     return files
 

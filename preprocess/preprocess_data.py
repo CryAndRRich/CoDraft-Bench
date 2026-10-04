@@ -1,10 +1,18 @@
+import pandas as pd
+
 from config.config_data import CONFIG_DATA
+
+def _given(value):
+    # An empty CSV cell reads as NaN, which is truthy and prints as "nan"; without this the
+    # category variant's blanked Nature/Purpose became "Nature: nan | Use: nan".
+    return not pd.isna(value) and bool(str(value).strip())
+
 def create_structured_text_enhanced(term, nature, purpose, class_id, nice_class_map):
     text = str(term).strip()
     context_parts = []
-    if nature and str(nature).strip():
+    if _given(nature):
         context_parts.append(f"Nature: {str(nature).strip()}")
-    if purpose and str(purpose).strip():
+    if _given(purpose):
         context_parts.append(f"Use: {str(purpose).strip()}")
     if class_id:
         try:
