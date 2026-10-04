@@ -2,7 +2,7 @@
 
     python llm_runner.py --llm qwen2.5-7b --task enrich              # all 7,724 terms
     python llm_runner.py --llm qwen2.5-7b --task enrich --scope test # the 2,928 test terms
-    python llm_runner.py --llm qwen2.5-7b --task classify            # 0- and 10-shot, plain and own
+    python llm_runner.py --llm qwen2.5-7b --task classify            # 0- and 10-shot: plain, codraft, own
     python llm_runner.py --llm qwen2.5-7b --task enrich classify --smoke
     python llm_runner.py --check      # the variant builder and the metrics, against the shipped data
     python llm_runner.py --list
@@ -187,9 +187,8 @@ def classify_task(client, spec, meta, data_root, out_root, variants, shots, smok
 
 
 def run_llm(llm, tasks=("enrich",), data_root=None, out_root=".", scope="all",
-            variants=("plain", "own"), shots=(0, 10), smoke=False, batch_size=None,
+            variants=("plain", "codraft", "own"), shots=(0, 10), smoke=False, batch_size=None,
             workers=None, port=8000, seed=0):
-    from codraft_enrichment.llm import make_client, served_revision, package_versions
     tasks = [tasks] if isinstance(tasks, str) else list(tasks)
     bad = set(tasks) - {"enrich", "classify"}
     if bad:
@@ -201,25 +200,53 @@ def run_llm(llm, tasks=("enrich",), data_root=None, out_root=".", scope="all",
     name = ("SMOKE_" if smoke else "") + spec["tag"]
     log = os.path.join(out_root, "logs", f"{name}_{'-'.join(tasks)}.log")
     files = [log]
+    finished = False
+    try:
+        _run(spec, tasks, files, log, data_root, out_root, scope, variants, shots, smoke,
+             batch_size, workers, port, seed)
+        finished = True
+    finally:
+        # Packaged even when a run fails, so its logs (and whatever it finished) are one
+        # download; the name then ends in _FAILED.
+        prefix = "SMOKE_" if smoke else ""
+        for pattern in (f"attributes/{name}_*", f"results/{prefix}llm_{spec['tag']}_*",
+                        f"results/cm_{prefix}llm_{spec['tag']}_*", f"logs/vllm_{spec['tag']}.log"):
+            files += glob.glob(os.path.join(out_root, pattern))
+        zname = f"{prefix}codraft_llm_{spec['tag']}_{'-'.join(tasks)}" + ("" if finished else "_FAILED")
+        path = package(files, out_root, zname + ".zip")
+    return path
+
+
+def _run(spec, tasks, files, log, data_root, out_root, scope, variants, shots, smoke,
+         batch_size, workers, port, seed):
     with _Tee(log):
-        print(f"LLM {spec['tag']} = {spec['model']} ({spec['backend']}) | tasks {tasks} | "
-              f"data {data_root} | out {out_root}" + ("  SMOKE TEST" if smoke else ""))
-        meta = {"llm": spec["tag"], "model": spec["model"], "serving": spec,
-                "revision": served_revision(spec), "environment": package_versions(),
-                "seed": seed, "temperature": 0, "started": time.strftime("%Y-%m-%d %H:%M:%S")}
-        print("revision:", meta["revision"], "| env:", json.dumps(meta["environment"]))
-        with _server(spec, out_root, port) as server:
-            client = make_client(spec, server.base_url if server else None, seed=seed)
-            if "enrich" in tasks:
-                files += enrich_task(client, spec, meta, data_root, out_root, scope, smoke,
-                                     batch_size, workers)
-            if "classify" in tasks:
-                # short answers: a local server takes many at once, a hosted API its own limit
-                files += classify_task(client, spec, meta, data_root, out_root, variants, shots,
-                                       smoke, max(workers, 32) if spec["backend"] == "vllm" else workers)
-        if spec["backend"] == "vllm":
-            files.append(os.path.join(out_root, "logs", f"vllm_{spec['tag']}.log"))
-    return package(files, out_root, f"{'SMOKE_' if smoke else ''}codraft_llm_{spec['tag']}_{'-'.join(tasks)}.zip")
+        try:
+            _tasks(spec, tasks, files, data_root, out_root, scope, variants, shots, smoke,
+                   batch_size, workers, port, seed)
+        except BaseException:
+            import traceback
+            traceback.print_exc(file=sys.stdout)      # into the log too
+            raise
+
+
+def _tasks(spec, tasks, files, data_root, out_root, scope, variants, shots, smoke,
+           batch_size, workers, port, seed):
+    from codraft_enrichment.llm import make_client, served_revision, package_versions
+    print(f"LLM {spec['tag']} = {spec['model']} ({spec['backend']}) | tasks {tasks} | "
+          f"data {data_root} | out {out_root}" + ("  SMOKE TEST" if smoke else ""))
+    meta = {"llm": spec["tag"], "model": spec["model"], "serving": spec,
+            "revision": served_revision(spec), "environment": package_versions(),
+            "seed": seed, "temperature": 0, "started": time.strftime("%Y-%m-%d %H:%M:%S")}
+    print("revision:", meta["revision"], "| env:", json.dumps(meta["environment"]))
+    with _server(spec, out_root, port) as server:
+        client = make_client(spec, server.base_url if server else None, seed=seed)
+        if "enrich" in tasks:
+            files += enrich_task(client, spec, meta, data_root, out_root, scope, smoke,
+                                 batch_size, workers)
+        if "classify" in tasks:
+            # short answers: a local server takes many at once, a hosted API its own limit
+            files += classify_task(client, spec, meta, data_root, out_root, variants, shots,
+                                   smoke, max(workers, 32) if spec["backend"] == "vllm" else workers)
 
 
 def package(files, out_root, name):
@@ -266,7 +293,7 @@ def main():
     ap.add_argument("--llm")
     ap.add_argument("--task", nargs="+", default=["enrich"], choices=["enrich", "classify"])
     ap.add_argument("--scope", default="all", choices=["all", "test"])
-    ap.add_argument("--variants", nargs="+", default=["plain", "own"],
+    ap.add_argument("--variants", nargs="+", default=["plain", "codraft", "own"],
                     help='"plain", "own" (this LLM\'s attributes) or a data variant such as "codraft"')
     ap.add_argument("--shots", nargs="+", type=int, default=[0, 10])
     ap.add_argument("--data-root", default=None)

@@ -55,8 +55,8 @@ class VLLMServer:
             if self.proc.poll() is not None:
                 self._log.close()
                 raise RuntimeError(f"vLLM exited with code {self.proc.returncode} while loading "
-                                   f"{self.spec['model']}. Last lines of {self.log_path}:\n"
-                                   + self.tail())
+                                   f"{self.spec['model']}. Errors in {self.log_path}:\n"
+                                   + self.errors() + "\n\nLast lines:\n" + self.tail(15))
             try:
                 with urllib.request.urlopen(f"{self.base_url}/models", timeout=5) as r:
                     if r.status == 200:
@@ -85,6 +85,24 @@ class VLLMServer:
             return "".join(open(self.log_path).readlines()[-n:])
         except Exception:
             return "(no log)"
+
+    def errors(self, n=25):
+        """The lines that name an error, first ones first. When a vLLM worker dies, the API
+        server's own traceback at the end only says "see root cause above"; the cause is in
+        the worker's lines further up."""
+        try:
+            lines = open(self.log_path).readlines()
+        except Exception:
+            return "(no log)"
+        keep, seen = [], set()
+        for line in lines:
+            msg = line.split(")", 1)[-1].strip() if line.startswith("(") else line.strip()
+            if any(w in msg for w in ("Error", "error:", "Exception", "CUDA out of memory",
+                                       "not supported", "does not support", "Unsupported")) \
+                    and "Engine core initialization failed" not in msg and msg not in seen:
+                seen.add(msg)
+                keep.append(line.rstrip())
+        return "\n".join(keep[:n]) or "(no error lines; see the full log)"
 
 
 def strict_schema(model, max_items=None, min_items=None):
@@ -117,8 +135,13 @@ def strict_schema(model, max_items=None, min_items=None):
 class LLMClient:
     """Chat completions constrained to a JSON schema, at temperature 0."""
 
+    # Transport errors in a row (across all threads) before the run is stopped: a dead
+    # server would otherwise make every remaining request wait through its retries.
+    MAX_CONSECUTIVE_ERRORS = 20
+
     def __init__(self, spec, base_url, api_key="EMPTY", seed=0, timeout=600):
         self.spec, self.seed = spec, seed
+        self.consecutive_errors = 0
         self.model = spec["tag"] if spec["backend"] == "vllm" else spec["model"]
         self.client = openai.OpenAI(base_url=base_url, api_key=api_key, timeout=timeout,
                                     max_retries=0)
@@ -161,8 +184,13 @@ class LLMClient:
                 return None, info
             except Exception as e:
                 info["error"] = f"{type(e).__name__}: {e}"[:300]
+                self.consecutive_errors += 1
+                if self.consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
+                    raise RuntimeError(f"{self.consecutive_errors} requests in a row failed; the "
+                                       f"LLM endpoint looks down. Last error: {info['error']}")
                 time.sleep(min(60, 5 * 2 ** attempt))
                 continue
+            self.consecutive_errors = 0
             if r.usage:
                 info["prompt_tokens"] += r.usage.prompt_tokens or 0
                 info["completion_tokens"] += r.usage.completion_tokens or 0
