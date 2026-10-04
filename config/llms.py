@@ -9,7 +9,8 @@ backend
   api      a hosted OpenAI-compatible endpoint (Gemini); needs an API key
 
 Served on a Kaggle T4 x2: fp16 only (Turing has no bf16), so a 7-9B model in fp16 takes
-both cards (tensor_parallel=2). A model that needs bf16 to be stable must be tested first.
+both cards (tensor_parallel=2). A model vLLM will not run in fp16 (Gemma) needs fp32, which
+doubles its memory.
 
 system     how the chat template takes the system prompt
   native   as a system message
@@ -30,12 +31,13 @@ LLMS = {
     "qwen2.5-7b":   dict(model="Qwen/Qwen2.5-7B-Instruct"),
     "qwen3-8b":     dict(model="Qwen/Qwen3-8B", chat_kwargs={"enable_thinking": False}),
     "llama3.1-8b":  dict(model="meta-llama/Llama-3.1-8B-Instruct", gated=True),
-    # Gemma 2's template rejects a system role. vLLM warns that Gemma 2 can overflow in
-    # fp16; the smoke test shows whether it does on this prompt.
-    # Its context is 8k, so batches are halved: ten terms of a class with a long heading
-    # (class 9) plus their answers would not fit.
-    "gemma2-9b":    dict(model="google/gemma-2-9b-it", gated=True, system="merge",
-                         max_model_len=8192, batch_size=5),
+    # Gemma: vLLM refuses Gemma 2 / 3 in fp16 (numerical instability), and a T4 has no bf16,
+    # so Gemma runs in fp32 here. Gemma-2-9B in fp32 (~37 GB) does not fit two T4s; the
+    # 4B Gemma 3 (~17 GB) does. gemma-2-2b is the fallback: text only, 8k context, and a
+    # template without a system role.
+    "gemma3-4b":    dict(model="google/gemma-3-4b-it", gated=True, dtype="float32"),
+    "gemma2-2b":    dict(model="google/gemma-2-2b-it", gated=True, dtype="float32",
+                         system="merge", max_model_len=8192, batch_size=5),
     # Llama-3.1 architecture; reasoning is switched off through the system prompt.
     "nemotron-nano-8b": dict(model="nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
                              system="detailed thinking off"),

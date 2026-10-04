@@ -116,13 +116,13 @@ RUNS = {
              table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Llama-3.1-8B"),
     26: dict(name="xgboost_codraft_llama3.1-8b", family="xgboost", model=None,      variant="codraft_llama3.1-8b",
              table="Robustness", row="XGBoost via TF-IDF, CoDraft by Llama-3.1-8B"),
-    27: dict(name="probe_run07_gemma2-9b",    family="probe",   model=BGE_RERANKER, variant="codraft_gemma2-9b",
+    27: dict(name="probe_run07_gemma3-4b",    family="probe",   model=BGE_RERANKER, variant="codraft_gemma3-4b",
              source="07_multi_codraft_seed42",
-             table="Robustness", row="run 7 on Gemma-2-9B attributes, no retraining"),
-    28: dict(name="multi_codraft_gemma2-9b",  family="multi",   model=BGE_RERANKER, variant="codraft_gemma2-9b",
-             table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Gemma-2-9B"),
-    29: dict(name="xgboost_codraft_gemma2-9b", family="xgboost", model=None,        variant="codraft_gemma2-9b",
-             table="Robustness", row="XGBoost via TF-IDF, CoDraft by Gemma-2-9B"),
+             table="Robustness", row="run 7 on Gemma-3-4B attributes, no retraining"),
+    28: dict(name="multi_codraft_gemma3-4b",  family="multi",   model=BGE_RERANKER, variant="codraft_gemma3-4b",
+             table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Gemma-3-4B"),
+    29: dict(name="xgboost_codraft_gemma3-4b", family="xgboost", model=None,        variant="codraft_gemma3-4b",
+             table="Robustness", row="XGBoost via TF-IDF, CoDraft by Gemma-3-4B"),
 }
 
 
