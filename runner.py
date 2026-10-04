@@ -62,6 +62,40 @@ def find_data_root(hint=None):
     )
 
 
+def find_checkpoint(source, hint=None):
+    """A trained multi-task checkpoint: the folder holding model.safetensors and config.json.
+
+    Looks in weights/<source>/model locally, then anywhere under /kaggle/input (attach the
+    run's model/ folder as a Kaggle dataset). Kaggle may flatten the folder name, so a
+    multi-task checkpoint is recognised by its config rather than its path.
+    """
+    def ok(d):
+        return d and os.path.isfile(os.path.join(d, "model.safetensors")) \
+            and os.path.isfile(os.path.join(d, "config.json"))
+    for c in (hint, os.environ.get("CODRAFT_CKPT"),
+              os.path.join(REPO_DIR, "weights", source, "model"),
+              os.path.join(REPO_DIR, "weights", source)):
+        if ok(c):
+            return c
+    found = []
+    if os.path.isdir("/kaggle/input"):
+        for root, _, files in os.walk("/kaggle/input"):
+            if "model.safetensors" in files and "added_tokens.json" in files and "config.json" in files:
+                try:
+                    if json.load(open(os.path.join(root, "config.json"))).get("num_product_classes"):
+                        found.append(root)
+                except Exception:
+                    pass
+    named = [f for f in found if source in f]
+    if len(named) == 1:
+        return named[0]
+    if len(found) == 1:
+        return found[0]
+    raise FileNotFoundError(
+        f"checkpoint for {source} not found" + (f"; candidates: {found}" if found else "")
+        + f". Attach weights/{source}/model as a Kaggle dataset, or set CODRAFT_CKPT.")
+
+
 def _smoke_data(data_root, variant, tmp_root):
     """A tiny copy of one variant that still holds all five labels, for a quick check."""
     import pandas as pd
@@ -267,6 +301,167 @@ def run_experiment(run_id, data_root=None, out_root=".", seed=DEFAULT_SEED, smok
                      best_checkpoint=trainer.state.best_model_checkpoint,
                      best_val_f1_macro=trainer.state.best_metric,
                      vocab_size=len(tokenizer))
+    elif family == "probe":
+        import inspect
+        from datasets import Dataset
+        from transformers import AutoTokenizer, DataCollatorWithPadding, Trainer, TrainingArguments
+        from model.models.MultiTask import JointClassSimBGE
+        from preprocess.preprocess_data import preprocess
+        from preprocess.data_loader import create_patterns, preprocess_dataset
+        from utils import get_preds_multi
+
+        ckpt = find_checkpoint(spec["source"])
+        print("checkpoint:", ckpt)
+        tokenizer = AutoTokenizer.from_pretrained(ckpt, use_fast=False)
+        model = JointClassSimBGE.from_pretrained(ckpt).to(device).eval()
+        nice = sorted(CONFIG_DATA.NICE_CLASS_MAP)
+        class_to_token = {c: f"[CLASS_{c}]" for c in nice}
+        class_to_id = {c: i for i, c in enumerate(nice)}
+        bad = [t for t in class_to_token.values() if len(tokenizer.encode(t, add_special_tokens=False)) != 1]
+        assert not bad, f"checkpoint tokenizer lacks the class tokens: {bad[:5]}"
+
+        raw = pd.read_csv(os.path.join(data_root, spec["variant"], "test.csv"), low_memory=False)
+        base = preprocess(raw.copy())
+
+        def build(term, nature, purpose, cls, use_n=True, use_p=True, use_c=True):
+            # Same format as preprocess_data.create_structured_text_enhanced, with switches.
+            parts = []
+            if use_n and str(nature).strip():
+                parts.append(f"Nature: {str(nature).strip()}")
+            if use_p and str(purpose).strip():
+                parts.append(f"Use: {str(purpose).strip()}")
+            if use_c and CONFIG_DATA.NICE_CLASS_MAP.get(int(cls), ""):
+                parts.append(f"Category: {CONFIG_DATA.NICE_CLASS_MAP[int(cls)]}")
+            t = str(term).strip()
+            return f"{t} [ {' | '.join(parts)} ]" if parts else t
+
+        def frame(n1, p1, n2, p2, **kw):
+            d = base.copy()
+            d["input_text_1"] = [build(t, n, p, c, **kw) for t, n, p, c in zip(d["Term 1"], n1, p1, d["Class 1"])]
+            d["input_text_2"] = [build(t, n, p, c, **kw) for t, n, p, c in zip(d["Term 2"], n2, p2, d["Class 2"])]
+            return d
+
+        N1, P1, N2, P2 = (raw[c].fillna("").astype(str).values for c in ("Nature 1", "Purpose 1", "Nature 2", "Purpose 2"))
+        full = frame(N1, P1, N2, P2)
+        assert (full["input_text_1"] == base["input_text_1"]).all() and \
+            (full["input_text_2"] == base["input_text_2"]).all(), "probe input builder drifted from preprocess()"
+        # shuffled: every side gets the (Nature, Purpose) of a random other side
+        rng = np.random.default_rng(seed)
+        pool = np.array(list(zip(np.r_[N1, N2], np.r_[P1, P2])), dtype=object)
+        perm = pool[rng.permutation(len(pool))]
+        n = len(raw)
+        conds = {
+            "full": full,
+            "no_nature": frame([""] * n, P1, [""] * n, P2),
+            "no_purpose": frame(N1, [""] * n, N2, [""] * n),
+            "heading_only": frame([""] * n, [""] * n, [""] * n, [""] * n),
+            "no_heading": frame(N1, P1, N2, P2, use_c=False),
+            "bare_term": frame([""] * n, [""] * n, [""] * n, [""] * n, use_c=False),
+            "shuffled_attributes": frame(perm[:n, 0], perm[:n, 1], perm[n:, 0], perm[n:, 1]),
+        }
+
+        tok_kw = ("processing_class" if "processing_class" in
+                  inspect.signature(Trainer.__init__).parameters else "tokenizer")
+        args = TrainingArguments(output_dir=scratch, per_device_eval_batch_size=16, report_to="none",
+                                 fp16=torch.cuda.is_available(), remove_unused_columns=False,
+                                 dataloader_num_workers=2)
+        trainer = Trainer(model=model, args=args, data_collator=DataCollatorWithPadding(tokenizer),
+                          **{tok_kw: tokenizer})
+        cols = ["input_ids", "attention_mask", "labels", "aux_labels"]
+        results = {}
+        for name, d in conds.items():
+            aug = create_patterns(d, tokenizer, class_to_token, class_to_id)
+            ds = Dataset.from_pandas(aug).map(preprocess_dataset, batched=True,
+                                              fn_kwargs={"tokenizer": tokenizer},
+                                              remove_columns=aug.columns.tolist())
+            ds.set_format(type="torch", columns=cols)
+            p, t, lg = get_preds_multi(trainer, ds, d, return_logits=True)
+            build_result_df(d, t, p).to_csv(os.path.join(results_dir, f"{tag}_{name}_preds.csv"), index=False)
+            np.save(os.path.join(results_dir, f"{tag}_{name}_logits.npy"), lg)
+            mc = get_stats(build_result_df(d, t, p), fig_prefix=os.path.join(results_dir, f"cm_{tag}_{name}"),
+                           return_metrics=True)
+            results[name] = {"f1_macro": mc["f1_macro"], "qwk": float(mc["qwk"]), "mae": float(mc["mae"]),
+                             "adjacent_acc": mc["adjacent_acc"], "severe_rate": mc["severe_rate"],
+                             "per_class_f1": [r["f1"] for r in mc["per_class"]],
+                             "example_input": d["input_text_1"].iloc[0]}
+            print(f"[probe] {name:20s} Macro-F1 {mc['f1_macro']*100:.2f} | QWK {mc['qwk']:.4f} | MAE {mc['mae']:.4f}")
+            if name == "full":
+                preds, true, df_test = p, t, d
+        for name in results:
+            results[name]["delta_f1_vs_full"] = results[name]["f1_macro"] - results["full"]["f1_macro"]
+        save_fn = None   # inference only; no new weights
+        extra.update(checkpoint=ckpt, conditions=results)
+
+    elif family == "hybrid":
+        import torch.nn as nn
+        from sentence_transformers import SentenceTransformer
+        from sklearn.metrics import f1_score as _f1
+
+        dm = data_manager(None, "ml")
+        df_train, df_val, df_test = dm.get_data()
+        # CODRAFT_HYBRID_ENCODER swaps in a small encoder for local testing only.
+        enc_name = os.environ.get("CODRAFT_HYBRID_ENCODER", spec["model"])
+        enc = SentenceTransformer(enc_name, device=str(device), trust_remote_code=True)
+        texts = sorted(set(pd.concat([d[c] for d in (df_train, df_val, df_test)
+                                      for c in ("input_text_1", "input_text_2")]).astype(str)))
+        emb = enc.encode(texts, batch_size=64, convert_to_numpy=True, normalize_embeddings=True,
+                         show_progress_bar=True)
+        row = {t: i for i, t in enumerate(texts)}
+        del enc
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        def feats(d):
+            u = emb[[row[str(t)] for t in d["input_text_1"]]]
+            v = emb[[row[str(t)] for t in d["input_text_2"]]]
+            c1 = np.eye(45, dtype=np.float32)[d["Class 1"].values - 1]
+            c2 = np.eye(45, dtype=np.float32)[d["Class 2"].values - 1]
+            same = (d["Class 1"].values == d["Class 2"].values).astype(np.float32)[:, None]
+            return np.hstack([u, v, np.abs(u - v), u * v, c1, c2, same]).astype(np.float32)
+
+        Xtr, Xva, Xte = (torch.tensor(feats(d)) for d in (df_train, df_val, df_test))
+        ytr = torch.tensor(df_train["label_score"].values)
+        cw = compute_class_weight(df_train["label_score"].values)
+        net = nn.Sequential(nn.Linear(Xtr.shape[1], 1024), nn.ReLU(), nn.Dropout(0.1),
+                            nn.Linear(1024, 512), nn.ReLU(), nn.Dropout(0.1),
+                            nn.Linear(512, 256), nn.ReLU(), nn.Dropout(0.1),
+                            nn.Linear(256, 5)).to(device)
+        opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
+        crit = nn.CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float32, device=device))
+        max_epochs, patience = (2, 2) if smoke else (50, 8)
+        best, best_state, best_epoch, wait = -1.0, None, 0, 0
+
+        def predict(X):
+            net.eval()
+            with torch.no_grad():
+                return torch.cat([net(X[i:i + 1024].to(device)).argmax(1).cpu()
+                                  for i in range(0, len(X), 1024)]).numpy()
+        for epoch in range(1, max_epochs + 1):
+            net.train()
+            order = torch.randperm(len(Xtr), generator=generator)
+            for i in range(0, len(order), 256):
+                b = order[i:i + 256]
+                opt.zero_grad()
+                loss = crit(net(Xtr[b].to(device)), ytr[b].to(device))
+                loss.backward()
+                opt.step()
+            vf = _f1(df_val["label_score"].values, predict(Xva), average="macro")
+            print(f"epoch {epoch} | loss {loss.item():.4f} | val macro-F1 {vf:.4f}")
+            if vf > best:
+                best, best_epoch, wait = vf, epoch, 0
+                best_state = {k: t.detach().cpu().clone() for k, t in net.state_dict().items()}
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+        net.load_state_dict(best_state)
+        preds, true = predict(Xte), df_test["label_score"].values
+        def save_fn():
+            torch.save({"state_dict": best_state, "encoder": enc_name, "in_dim": int(Xtr.shape[1]),
+                        "features": "[u, v, |u-v|, u*v, onehot(class1), onehot(class2), same_class]"},
+                       os.path.join(weights_dir, "hybrid_mlp.pt"))
+        extra.update(encoder=enc_name, feature_dim=int(Xtr.shape[1]), best_epoch=best_epoch,
+                     epochs_run=epoch, best_val_f1_macro=float(best), class_weights=list(map(float, cw)),
+                     unique_texts=len(texts))
     else:
         raise ValueError(f"unknown family {family!r}")
 

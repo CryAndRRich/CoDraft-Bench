@@ -69,6 +69,29 @@ RUNS = {
     17: dict(name="multi_codraft_alpha0",  family="multi",   model=BGE_RERANKER, variant="codraft",
              alpha=0.0,
              table="Table 3", row="focal loss only, no rank penalty"),
+
+    # ---- added after the first 17 runs ------------------------------------------------
+    # Removing the masked head (15) or the rank-aware loss (16) alone costs no macro-F1,
+    # yet the full model beats a plain cross-encoder on the same backbone (5) by +4.7.
+    # This run removes both, leaving a plain cross-encoder trained with the multi-task
+    # recipe (two masked views averaged at test time, class tokens, 10 epochs, cosine
+    # schedule). If it matches run 7, the gap is the recipe, not the architecture.
+    18: dict(name="multi_codraft_noaux_ce", family="multi",  model=BGE_RERANKER, variant="codraft",
+             aux_weight=0.0, loss_type="ce",
+             table="Table 3", row="neither head nor rank-aware loss: the multi-task recipe alone"),
+    # Inference only: run 7's trained model on test inputs with parts of the enrichment
+    # removed or shuffled. Says which part of the input the model actually relies on.
+    # Needs run 7's checkpoint (weights/07_multi_codraft_seed42/model) available locally or
+    # attached on Kaggle as a dataset.
+    19: dict(name="probe_run07_inputs",    family="probe",   model=BGE_RERANKER, variant="codraft",
+             source="07_multi_codraft_seed42",
+             table="Analysis", row="run 7 at test time with Nature / Purpose / heading removed or shuffled"),
+    # Le Nir et al. (2026)'s best design, re-headed to five classes: frozen sentence
+    # embeddings of both names, one-hot NICE classes and a same-class flag, into an
+    # MLP 1024-512-256. The direct rival to CoDraft: taxonomy as one-hot categoricals
+    # instead of LLM-generated attributes.
+    20: dict(name="hybrid_mlp_bgem3_plain", family="hybrid", model=BGE_M3,       variant="plain",
+             table="Table 2", row="Hybrid MLP (P1): embeddings + one-hot NICE classes"),
 }
 
 

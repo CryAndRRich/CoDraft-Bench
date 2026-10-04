@@ -11,7 +11,7 @@ opposition rulings use: `Dissimilar (0)`, `Low similar (1)`, `Similar (2)`,
 
 ```
 runner.py             runs any experiment end to end: python runner.py --run-id 7
-config/runs.py        every experiment in the paper, keyed by run ID (17 runs)
+config/runs.py        every experiment in the paper, keyed by run ID (20 runs)
 codraft_enrichment/   LLM enrichment: a product name T plus its NICE class heading C
                       becomes (Nature, Purpose, expanded name)
 config/               CONFIG_DATA (NICE class map, class tokens), CONFIG_MODEL (hyperparameters)
@@ -44,7 +44,7 @@ compare pair by pair. `data/README.md` has the full description.
 Every experiment has an ID in `config/runs.py`:
 
 ```bash
-python runner.py --list              # the 17 runs
+python runner.py --list              # the 20 runs
 python runner.py --run-id 7          # the full model
 python runner.py --run-id 7 --smoke  # tiny subset, one epoch: checks the pipeline
 ```
