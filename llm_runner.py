@@ -2,7 +2,7 @@
 
     python llm_runner.py --llm qwen2.5-7b --task enrich              # all 7,724 terms
     python llm_runner.py --llm qwen2.5-7b --task enrich --scope test # the 2,928 test terms
-    python llm_runner.py --llm qwen2.5-7b --task classify            # 0- and 10-shot, plain and codraft
+    python llm_runner.py --llm qwen2.5-7b --task classify            # 0- and 10-shot, plain and own
     python llm_runner.py --llm qwen2.5-7b --task enrich classify --smoke
     python llm_runner.py --check      # the variant builder and the metrics, against the shipped data
     python llm_runner.py --list
@@ -16,6 +16,8 @@ Outputs under <out>/, all named after the LLM tag:
     attributes/<tag>_enrich.json       model revision, versions, prompt, coverage, tokens, time
     codraft_<tag>/{train,val,test}.csv the data variant, row-aligned with data/codraft/
     results/llm_<tag>_<k>shot_<variant>_preds.csv / _metrics.json / cm_*.pdf/.png
+        variant "plain" (the name only), "own" (codraft_<tag>: this LLM's own attributes)
+        or any data variant, e.g. "codraft" (Gemini's attributes)
     logs/<tag>_<task>.log, logs/vllm_<tag>.log
 and one zip of all of it, codraft_llm_<tag>_<tasks>.zip.
 """
@@ -33,6 +35,13 @@ if REPO_DIR not in sys.path:
 
 from config.llms import get_llm, describe
 from runner import find_data_root, find_variant_root
+
+SMOKE_PER_LABEL = 10     # the smoke test classifies 10 test pairs of each label
+
+
+def _smoke_pairs(test, label_col):
+    """The smoke test's pairs: the first SMOKE_PER_LABEL of each label, in file order."""
+    return test.groupby(label_col, sort=False).head(SMOKE_PER_LABEL).reset_index(drop=True)
 
 
 class _Tee:
@@ -75,8 +84,16 @@ def enrich_task(client, spec, meta, data_root, out_root, scope, smoke, batch_siz
     from codraft_enrichment.variant import build_variant
     tag = ("SMOKE_" if smoke else "") + spec["tag"]
     table = term_table(data_root, scope, gemini_cache=os.path.join(data_root, "term_attributes.csv"))
+    smoke_ids = None
     if smoke:
-        table = table.groupby("Class", sort=False).head(1).reset_index(drop=True)   # one term per class
+        # the terms of the pairs the smoke classification uses, so "own" can be checked too
+        import pandas as pd
+        from codraft_enrichment.enrich import norm
+        test = pd.read_csv(os.path.join(data_root, "codraft", "test.csv"), low_memory=False)
+        pick = _smoke_pairs(test, "Similarity")
+        smoke_ids = list(pick["Pair ID"])
+        keys = {(norm(t), int(c)) for side in "12" for t, c in zip(pick[f"Term {side}"], pick[f"Class {side}"])}
+        table = table[[(k, c) in keys for k, c in zip(table["key"], table["Class"])]].reset_index(drop=True)
     print(f"enrichment: {len(table)} (term, class) pairs, scope={scope}")
     attr_dir = os.path.join(out_root, "attributes")
     attrs, st = enrich(client, table, attr_dir, tag, batch_size=batch_size, workers=workers)
@@ -87,17 +104,20 @@ def enrich_task(client, spec, meta, data_root, out_root, scope, smoke, batch_siz
     written = {}
     # next to the shipped variants locally; on Kaggle the dataset is read-only, so in the output
     variant_root = out_root if os.path.abspath(data_root).startswith("/kaggle/input") else data_root
-    if not smoke:
-        try:
-            written = build_variant(data_root, path, f"codraft_{spec['tag']}", out_root=variant_root)
-        except ValueError as e:
-            print(f"!! no variant written: {e}")
+    vname = ("SMOKE_" if smoke else "") + f"codraft_{spec['tag']}"
+    if smoke:
+        variant_root = out_root          # a 50-pair test file, never next to the real data
+    try:
+        written = build_variant(data_root, path, vname, out_root=variant_root,
+                                splits=("test",) if smoke else None, pair_ids=smoke_ids)
+    except ValueError as e:
+        print(f"!! no variant written: {e}")
     record = {**meta, "task": "enrich", "tag": tag, "scope": scope, "smoke": smoke,
               "attributes": os.path.relpath(path, out_root), "variant_splits": written, **st}
     with open(os.path.join(attr_dir, f"{tag}_enrich.json"), "w") as fh:
         json.dump(record, fh, indent=2, default=str)
     files = [path, os.path.join(attr_dir, f"{tag}_raw.jsonl"), os.path.join(attr_dir, f"{tag}_enrich.json")]
-    files += glob.glob(os.path.join(variant_root, f"codraft_{spec['tag']}", "*.csv")) if written else []
+    files += glob.glob(os.path.join(variant_root, vname, "*.csv")) if written else []
     return files
 
 
@@ -108,20 +128,29 @@ def classify_task(client, spec, meta, data_root, out_root, variants, shots, smok
     res = os.path.join(out_root, "results")
     os.makedirs(res, exist_ok=True)
     files = []
-    for variant in variants:
-        root = find_variant_root(data_root, variant, extra=(out_root,))
+    for name in variants:
+        # "own": the attributes this LLM produced (enrich first, in this session or attached)
+        variant = (("SMOKE_" if smoke else "") + f"codraft_{spec['tag']}") if name == "own" else name
+        try:
+            root = find_variant_root(data_root, variant, extra=(out_root,))
+        except FileNotFoundError:
+            if name != "own":
+                raise
+            raise FileNotFoundError(f"{variant}/ not found: run TASK = [\"enrich\", \"classify\"] so "
+                                    f"the attributes are made first, or attach a run that made them")
         test = load_pairs(root, variant, "test")
         if smoke:
-            test = test.groupby("label_score", sort=False).head(10).reset_index(drop=True)
+            test = _smoke_pairs(test, "label_score")
         has_train = os.path.isfile(os.path.join(root, variant, "train.csv"))
         train = load_pairs(root, variant, "train") if has_train and any(shots) else None
         for k in shots:
             if k and train is None:
                 # a test-only variant (enrich --scope test) has no demonstrations to draw
-                print(f"!! skipping {k}-shot on {variant}: it has no train split "
-                      f"(enrich with --scope all to get one)")
+                why = ("the smoke test enriches its 50 test pairs only" if smoke
+                       else "enrich with --scope all to get one")
+                print(f"!! skipping {k}-shot on {variant}: it has no train split ({why})")
                 continue
-            tag = ("SMOKE_" if smoke else "") + f"llm_{spec['tag']}_{k}shot_{variant}"
+            tag = ("SMOKE_" if smoke else "") + f"llm_{spec['tag']}_{k}shot_{name}"
             print("=" * 78 + f"\n{tag}: {len(test)} pairs, {k} demonstrations\n" + "=" * 78)
             demos = demonstrations(train, k=k) if k else None
             preds, st = classify(client, test, os.path.join(res, f"{tag}_raw.jsonl"),
@@ -153,7 +182,7 @@ def classify_task(client, spec, meta, data_root, out_root, variants, shots, smok
 
 
 def run_llm(llm, tasks=("enrich",), data_root=None, out_root=".", scope="all",
-            variants=("plain", "codraft"), shots=(0, 10), smoke=False, batch_size=None,
+            variants=("plain", "own"), shots=(0, 10), smoke=False, batch_size=None,
             workers=None, port=8000, seed=0):
     from codraft_enrichment.llm import make_client, served_revision, package_versions
     tasks = [tasks] if isinstance(tasks, str) else list(tasks)
@@ -232,7 +261,8 @@ def main():
     ap.add_argument("--llm")
     ap.add_argument("--task", nargs="+", default=["enrich"], choices=["enrich", "classify"])
     ap.add_argument("--scope", default="all", choices=["all", "test"])
-    ap.add_argument("--variants", nargs="+", default=["plain", "codraft"])
+    ap.add_argument("--variants", nargs="+", default=["plain", "own"],
+                    help='"plain", "own" (this LLM\'s attributes) or a data variant such as "codraft"')
     ap.add_argument("--shots", nargs="+", type=int, default=[0, 10])
     ap.add_argument("--data-root", default=None)
     ap.add_argument("--out-root", default=".")

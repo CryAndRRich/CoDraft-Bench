@@ -28,18 +28,21 @@ def load_attributes(path):
     return out, by_class
 
 
-def build_variant(data_root, attributes_csv, name, out_root=None, splits=None):
+def build_variant(data_root, attributes_csv, name, out_root=None, splits=None, pair_ids=None):
     """Write <out_root>/<name>/{split}.csv from data_root/codraft/ with the new attributes.
 
     splits: which splits to write; by default every split the attributes fully cover (so a
     test-only enrichment gives a test-only variant). A split asked for by name must be fully
     covered. Returns {split: number of rows}.
+    pair_ids: keep only these pairs, in their data/codraft/ order (the smoke test's subset).
     """
     attrs, by_class = load_attributes(attributes_csv)
     out_dir = os.path.join(out_root or data_root, name)
     written, skipped = {}, {}
     for split in (splits or SPLITS):
         base = pd.read_csv(os.path.join(data_root, "codraft", f"{split}.csv"), low_memory=False)
+        if pair_ids is not None:
+            base = base[base["Pair ID"].isin(set(pair_ids))].reset_index(drop=True)
         d = base.copy()
         ok = True
         for side in ("1", "2"):
