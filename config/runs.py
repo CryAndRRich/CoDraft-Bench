@@ -14,6 +14,7 @@ variant     which data/<variant>/ split the model reads
   plain     the bare product name
   category  name + NICE heading, Nature/Purpose blanked
   expanded  the LLM-rewritten name
+  codraft_<llm>  as codraft, with the attributes from another LLM (scripts/llm.ipynb)
 
 Multi-task overrides (only on the "multi" family):
   aux_weight  lambda in the paper; 0 switches the masked class head off
@@ -92,6 +93,36 @@ RUNS = {
     # instead of LLM-generated attributes.
     20: dict(name="hybrid_mlp_bgem3_plain", family="hybrid", model=BGE_M3,       variant="plain",
              table="Table 2", row="Hybrid MLP (P1): embeddings + one-hot NICE classes"),
+
+    # ---- an open LLM in place of Gemini as the enrichment source ---------------------
+    # Each needs data/codraft_<llm>/, built by scripts/llm.ipynb (TASK = "enrich"); on Kaggle
+    # attach that notebook's output as a dataset. Same prompt, schema and rows as
+    # data/codraft/; only the attributes differ. Three rows per LLM:
+    #   probe   run 7 as trained, predicting on the new attributes (no retraining)
+    #   multi   run 7 retrained on the new attributes
+    #   xgboost run 2 on the new attributes (minutes, CPU)
+    # The LLM tags are config/llms.py keys; change them here if the smoke test drops one.
+    21: dict(name="probe_run07_qwen2.5-7b",   family="probe",   model=BGE_RERANKER, variant="codraft_qwen2.5-7b",
+             source="07_multi_codraft_seed42",
+             table="Robustness", row="run 7 on Qwen2.5-7B attributes, no retraining"),
+    22: dict(name="multi_codraft_qwen2.5-7b", family="multi",   model=BGE_RERANKER, variant="codraft_qwen2.5-7b",
+             table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Qwen2.5-7B"),
+    23: dict(name="xgboost_codraft_qwen2.5-7b", family="xgboost", model=None,       variant="codraft_qwen2.5-7b",
+             table="Robustness", row="XGBoost via TF-IDF, CoDraft by Qwen2.5-7B"),
+    24: dict(name="probe_run07_llama3.1-8b",  family="probe",   model=BGE_RERANKER, variant="codraft_llama3.1-8b",
+             source="07_multi_codraft_seed42",
+             table="Robustness", row="run 7 on Llama-3.1-8B attributes, no retraining"),
+    25: dict(name="multi_codraft_llama3.1-8b", family="multi",  model=BGE_RERANKER, variant="codraft_llama3.1-8b",
+             table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Llama-3.1-8B"),
+    26: dict(name="xgboost_codraft_llama3.1-8b", family="xgboost", model=None,      variant="codraft_llama3.1-8b",
+             table="Robustness", row="XGBoost via TF-IDF, CoDraft by Llama-3.1-8B"),
+    27: dict(name="probe_run07_gemma2-9b",    family="probe",   model=BGE_RERANKER, variant="codraft_gemma2-9b",
+             source="07_multi_codraft_seed42",
+             table="Robustness", row="run 7 on Gemma-2-9B attributes, no retraining"),
+    28: dict(name="multi_codraft_gemma2-9b",  family="multi",   model=BGE_RERANKER, variant="codraft_gemma2-9b",
+             table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Gemma-2-9B"),
+    29: dict(name="xgboost_codraft_gemma2-9b", family="xgboost", model=None,        variant="codraft_gemma2-9b",
+             table="Robustness", row="XGBoost via TF-IDF, CoDraft by Gemma-2-9B"),
 }
 
 

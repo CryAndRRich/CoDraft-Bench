@@ -11,17 +11,17 @@ from config.config_data import CONFIG_DATA
 from .prompt import ENRICHMENT_PROMPTS
 from .schemas import SCHEMA_MAP
 
-def get_client(api_key):
+def get_client(api_key, base_url=None):
     client = instructor.from_openai(
         openai.OpenAI(
-            base_url=CONFIG_DATA.CODRAFT_CONFIG['base_url'],
+            base_url=base_url or CONFIG_DATA.CODRAFT_CONFIG['base_url'],
             api_key=api_key
         ),
         mode=instructor.Mode.JSON,
     )
     return client
 
-def process_batch(batch_data, client, version="v1"):
+def process_batch(batch_data, client, version="v1", model="gemini-2.5-flash"):
     try:
         batch_json = json.dumps(batch_data, indent=2)
         
@@ -30,7 +30,7 @@ def process_batch(batch_data, client, version="v1"):
         ResponseSchema = SCHEMA_MAP[version] 
 
         return client.chat.completions.create(
-            model="gemini-2.5-flash",
+            model=model,
             response_model=ResponseSchema,
             messages=[
                 {"role": "system", "content": sys_message},
@@ -42,7 +42,7 @@ def process_batch(batch_data, client, version="v1"):
         print(f"Error processing batch: {e}")
         return None
 
-def run_enrichment(df, client, output_file_dir=None, version="v1"):
+def run_enrichment(df, client, output_file_dir=None, version="v1", model="gemini-2.5-flash"):
     print(f"RUN ENRICHMENT (Version: {version}) ---")
     results = []
     BATCH_SIZE = CONFIG_DATA.CODRAFT_CONFIG['batch_size']
@@ -51,7 +51,7 @@ def run_enrichment(df, client, output_file_dir=None, version="v1"):
     for batch_df in tqdm(chunks, desc="Processing Batches"):
         batch_input = batch_df[['Term', 'Class', 'Description', 'Sub_group']].to_dict(orient='records')
         
-        response = process_batch(batch_input, client, version=version)
+        response = process_batch(batch_input, client, version=version, model=model)
         
         if response and response.items:
             for item in response.items:

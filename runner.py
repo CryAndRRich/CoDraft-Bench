@@ -62,6 +62,26 @@ def find_data_root(hint=None):
     )
 
 
+def find_variant_root(data_root, variant, extra=()):
+    """The directory holding <variant>/, which is data_root for the four shipped variants.
+
+    A variant built from another LLM's attributes (codraft_<llm>/, from scripts/llm.ipynb)
+    may sit elsewhere: in one of the extra directories, or in any dataset under
+    /kaggle/input (attach the LLM notebook's output as a dataset).
+    """
+    def ok(d):
+        return d and os.path.isfile(os.path.join(d, variant, "test.csv"))
+    for c in (data_root, *extra):
+        if ok(c):
+            return c
+    for depth in ("*", "*/*", "*/*/*", "*/*/*/*"):
+        for d in sorted(glob.glob(os.path.join("/kaggle/input", depth))):
+            if ok(d):
+                return d
+    raise FileNotFoundError(f"variant {variant!r} not found in {data_root} or under /kaggle/input; "
+                            f"expected a directory containing {variant}/test.csv")
+
+
 def find_checkpoint(source, hint=None):
     """A trained multi-task checkpoint: the folder holding model.safetensors and config.json.
 
@@ -153,7 +173,7 @@ def run_experiment(run_id, data_root=None, out_root=".", seed=DEFAULT_SEED, smok
     tag = f"{run_id:02d}_{spec['name']}_seed{seed}"
     if smoke:
         tag = "SMOKE_" + tag
-    data_root = find_data_root(data_root)
+    data_root = find_variant_root(find_data_root(data_root), spec["variant"])
     results_dir = os.path.join(out_root, "results")
     weights_dir = os.path.join(out_root, "weights", tag)
     scratch = os.path.join("/tmp" if os.path.isdir("/tmp") else out_root, "codraft_ckpt", tag)

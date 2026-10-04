@@ -1,0 +1,9 @@
+# Environment of scripts/llm.ipynb (llm_runner.py), separate from requirements.txt:
+# vLLM brings its own torch and transformers, newer than the training stack pins.
+# vLLM itself is installed by the notebook (VLLM_PIP), so its version is chosen there.
+openai>=1.40.0
+pydantic>=2.0.0
+pandas
+scikit-learn>=1.5.0
+matplotlib
+huggingface_hub
