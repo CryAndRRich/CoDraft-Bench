@@ -93,6 +93,21 @@ RUNS = {
     # instead of LLM-generated attributes.
     20: dict(name="hybrid_mlp_bgem3_plain", family="hybrid", model=BGE_M3,       variant="plain",
              table="Table 2", row="Hybrid MLP (P1): embeddings + one-hot NICE classes"),
+
+    # ---- run 7 with the CoDraft attributes from an open LLM instead of Gemini ----------
+    # Same pipeline as the paper, only f_LLM differs: scripts/llm.ipynb (TASK "enrich") ran
+    # the same prompt and schema, and data/codraft_<llm>/ joins its Nature / Purpose to the
+    # pairs by the rule that built data/codraft/ (llm_runner.py --check). Every setting is
+    # run 7's, so each run compares with run 7 pair by pair. On Kaggle, the codraft_<llm>/
+    # folders must be in an attached dataset; the runner finds them under /kaggle/input.
+    21: dict(name="multi_codraft_qwen2.5-7b",   family="multi", model=BGE_RERANKER, variant="codraft_qwen2.5-7b",
+             table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Qwen2.5-7B"),
+    22: dict(name="multi_codraft_qwen3-8b",     family="multi", model=BGE_RERANKER, variant="codraft_qwen3-8b",
+             table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Qwen3-8B"),
+    23: dict(name="multi_codraft_llama3.1-8b",  family="multi", model=BGE_RERANKER, variant="codraft_llama3.1-8b",
+             table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Llama-3.1-8B"),
+    24: dict(name="multi_codraft_nemotron-nano-8b", family="multi", model=BGE_RERANKER, variant="codraft_nemotron-nano-8b",
+             table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Nemotron-Nano-8B"),
 }
 
 
