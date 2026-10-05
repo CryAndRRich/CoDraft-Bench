@@ -19,12 +19,14 @@ system     how the chat template takes the system prompt
            is prepended to the user message instead
 chat_kwargs  passed to the chat template, e.g. Qwen3's thinking switch
 gated        the HF repo needs an accepted licence and HF_TOKEN
+rescue_penalty  repetition penalty of the last try for a term or pair that failed twice
+             (greedy decoding looping on a phrase); vLLM only, None switches it off
 """
 
 DEFAULTS = dict(backend="vllm", dtype="half", tensor_parallel=2, max_model_len=16384,
                 quantization=None, revision=None, system="native", chat_kwargs=None,
                 gated=False, gpu_memory_utilization=0.90, enforce_eager=False,
-                batch_size=10, workers=16)
+                batch_size=10, workers=16, rescue_penalty=1.15)
 
 LLMS = {
     # ---- the candidates (one per family; pick 2-3 after the smoke test) --------------

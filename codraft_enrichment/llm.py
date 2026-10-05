@@ -155,12 +155,15 @@ class LLMClient:
         # a fixed system prompt the model requires (e.g. a reasoning switch)
         return [{"role": "system", "content": mode}, {"role": "user", "content": f"{system}\n\n{user}"}]
 
-    def json(self, system, user, response_model, max_tokens, schema=None, attempts=4):
+    def json(self, system, user, response_model, max_tokens, schema=None, attempts=4,
+             sampling=None):
         """(parsed object or None, info). info carries token counts and the last error.
 
         A reply cut off at max_tokens is retried with twice the budget; a transport error
         is retried after a pause. Greedy decoding gives the same reply to the same prompt,
-        so an answer that fails validation is not retried.
+        so an answer that fails validation, or a request that times out (a reply that keeps
+        repeating itself), is not retried.
+        sampling: extra vLLM sampling parameters, e.g. {"repetition_penalty": 1.15}.
         """
         schema = schema or response_model.model_json_schema()
         kw = dict(model=self.model, messages=self.messages(system, user), temperature=0,
@@ -170,8 +173,11 @@ class LLMClient:
                                                    "schema": schema, "strict": True}})
         if self.spec["backend"] == "vllm":
             kw["seed"] = self.seed
+            extra = dict(sampling or {})
             if self.spec.get("chat_kwargs"):
-                kw["extra_body"] = {"chat_template_kwargs": self.spec["chat_kwargs"]}
+                extra["chat_template_kwargs"] = self.spec["chat_kwargs"]
+            if extra:
+                kw["extra_body"] = extra
         info = {"prompt_tokens": 0, "completion_tokens": 0, "error": None, "calls": 0}
         limit = self.spec.get("max_model_len", 8192)
         for attempt in range(attempts):
@@ -181,6 +187,10 @@ class LLMClient:
             except openai.BadRequestError as e:
                 # e.g. prompt + max_tokens over the context length: the same request fails again
                 info["error"] = f"BadRequestError: {e}"[:300]
+                return None, info
+            except openai.APITimeoutError as e:
+                # the server answers, but this reply ran past the timeout; it would again
+                info["error"] = f"APITimeoutError: {e}"[:300]
                 return None, info
             except Exception as e:
                 info["error"] = f"{type(e).__name__}: {e}"[:300]

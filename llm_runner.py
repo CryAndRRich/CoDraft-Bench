@@ -4,6 +4,7 @@
     python llm_runner.py --llm qwen2.5-7b --task enrich --scope test # the 2,928 test terms
     python llm_runner.py --llm qwen2.5-7b --task classify            # 0- and 10-shot: plain, codraft, own
     python llm_runner.py --llm qwen2.5-7b --task enrich classify --smoke
+    python llm_runner.py --llm nemotron-nano-8b --task enrich classify --resume-from <earlier zip, unpacked>
     python llm_runner.py --check      # the variant builder and the metrics, against the shipped data
     python llm_runner.py --list
 
@@ -72,6 +73,39 @@ class _Tee:
         self.fh.close()
 
 
+def _rescue(spec):
+    """Sampling for the last try of a term or pair that failed twice (vLLM only)."""
+    if spec["backend"] == "vllm" and spec.get("rescue_penalty"):
+        return {"repetition_penalty": spec["rescue_penalty"]}
+    return None
+
+
+def _resume_from(path, spec, smoke, out_root):
+    """Copy a previous run's progress (its *_raw.jsonl files) into this run's output folder,
+    so only what it did not finish is asked again. path: an unpacked earlier zip, e.g. one
+    attached on Kaggle; it is searched recursively for this LLM's files only."""
+    import shutil
+    prefix = "SMOKE_" if smoke else ""
+    want = {f"{prefix}{spec['tag']}_raw.jsonl": "attributes"}
+    found = {}
+    for root, _, fs in os.walk(path):
+        for f in fs:
+            if f in want or (f.startswith(f"{prefix}llm_{spec['tag']}_") and f.endswith("_raw.jsonl")):
+                found.setdefault(f, []).append(os.path.join(root, f))
+    if not found:
+        raise FileNotFoundError(f"--resume-from {path}: no *_raw.jsonl of {spec['tag']} in it")
+    for f, srcs in sorted(found.items()):
+        if len(srcs) > 1:
+            raise ValueError(f"--resume-from {path}: {f} found {len(srcs)} times: {srcs}")
+        dst = os.path.join(out_root, want.get(f, "results"), f)
+        if os.path.exists(dst):
+            print(f"resume: keeping {dst} (already here)")
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(srcs[0], dst)
+        print(f"resume: {sum(1 for _ in open(dst))} answers from {srcs[0]}")
+
+
 def _server(spec, out_root, port):
     """A context that serves the model (vLLM), or does nothing (hosted API)."""
     import contextlib
@@ -104,7 +138,8 @@ def enrich_task(client, spec, meta, data_root, out_root, scope, smoke, batch_siz
     work_dir = os.path.join(out_root, "attributes")
     attr_dir = os.path.join(data_root, "attributes") if in_data else work_dir
     variant_root = data_root if in_data else out_root
-    attrs, st = enrich(client, table, work_dir, tag, batch_size=batch_size, workers=workers)
+    attrs, st = enrich(client, table, work_dir, tag, batch_size=batch_size, workers=workers,
+                       rescue_sampling=_rescue(spec))
     os.makedirs(attr_dir, exist_ok=True)
     path = os.path.join(attr_dir, f"{tag}_attributes.csv")
     attrs.drop(columns=["key", "returned_term"]).to_csv(path, index=False)
@@ -159,7 +194,7 @@ def classify_task(client, spec, meta, data_root, out_root, variants, shots, smok
             print("=" * 78 + f"\n{tag}: {len(test)} pairs, {k} demonstrations\n" + "=" * 78)
             demos = demonstrations(train, k=k) if k else None
             preds, st = classify(client, test, os.path.join(res, f"{tag}_raw.jsonl"),
-                                 demos=demos, workers=workers)
+                                 demos=demos, workers=workers, rescue_sampling=_rescue(spec))
             ok = [p is not None for p in preds]
             if not all(ok):
                 print(f"!! {ok.count(False)} pairs got no answer; scored as Dissimilar (label 0)")
@@ -188,7 +223,7 @@ def classify_task(client, spec, meta, data_root, out_root, variants, shots, smok
 
 def run_llm(llm, tasks=("enrich",), data_root=None, out_root=".", scope="all",
             variants=("plain", "codraft", "own"), shots=(0, 10), smoke=False, batch_size=None,
-            workers=None, port=8000, seed=0):
+            workers=None, port=8000, seed=0, resume_from=None):
     tasks = [tasks] if isinstance(tasks, str) else list(tasks)
     bad = set(tasks) - {"enrich", "classify"}
     if bad:
@@ -203,7 +238,7 @@ def run_llm(llm, tasks=("enrich",), data_root=None, out_root=".", scope="all",
     finished = False
     try:
         _run(spec, tasks, files, log, data_root, out_root, scope, variants, shots, smoke,
-             batch_size, workers, port, seed)
+             batch_size, workers, port, seed, resume_from)
         finished = True
     finally:
         # Packaged even when a run fails, so its logs (and whatever it finished) are one
@@ -218,9 +253,11 @@ def run_llm(llm, tasks=("enrich",), data_root=None, out_root=".", scope="all",
 
 
 def _run(spec, tasks, files, log, data_root, out_root, scope, variants, shots, smoke,
-         batch_size, workers, port, seed):
+         batch_size, workers, port, seed, resume_from=None):
     with _Tee(log):
         try:
+            if resume_from:
+                _resume_from(resume_from, spec, smoke, out_root)
             _tasks(spec, tasks, files, data_root, out_root, scope, variants, shots, smoke,
                    batch_size, workers, port, seed)
         except BaseException:
@@ -301,6 +338,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--resume-from", default=None,
+                    help="an earlier run of the same LLM (its unpacked zip): only what it did not finish is asked again")
     ap.add_argument("--smoke", action="store_true", help="45 terms / 50 pairs: checks the pipeline")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--list", action="store_true")
@@ -312,7 +351,7 @@ def main():
         return
     run_llm(a.llm, a.task, data_root=a.data_root, out_root=a.out_root, scope=a.scope,
             variants=a.variants, shots=a.shots, smoke=a.smoke, batch_size=a.batch_size,
-            workers=a.workers, port=a.port)
+            workers=a.workers, port=a.port, resume_from=a.resume_from)
 
 
 if __name__ == "__main__":

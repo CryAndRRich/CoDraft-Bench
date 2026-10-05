@@ -78,8 +78,12 @@ def user_prompt(a, b, demos=None):
     return "\n\n".join(parts)
 
 
-def classify(client, pairs, out_path, demos=None, workers=32):
-    """Label every row of pairs; returns (predictions, stats). Resumes from out_path (JSONL)."""
+def classify(client, pairs, out_path, demos=None, workers=32, rescue_sampling=None):
+    """Label every row of pairs; returns (predictions, stats). Resumes from out_path (JSONL).
+
+    A pair left without an answer gets one more try with rescue_sampling (a repetition
+    penalty), marked "rescued" in the JSONL and counted in the stats.
+    """
     done = {}
     if os.path.isfile(out_path):
         for line in open(out_path):
@@ -90,11 +94,13 @@ def classify(client, pairs, out_path, demos=None, workers=32):
     fh = open(out_path, "a", buffering=1)
     stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "errors": []}
 
-    def one(r):
+    def one(r, sampling=None):
         out, info = client.json(SYSTEM, user_prompt(r["input_text_1"], r["input_text_2"], demos),
-                                Verdict, max_tokens=32)
+                                Verdict, max_tokens=32, sampling=sampling)
         rec = {"Pair ID": r["Pair ID"], "label": int(r["label_score"]),
                "pred": LABELS.index(out.label) if out else None, "error": info["error"]}
+        if sampling:
+            rec["rescued"] = True
         with lock:
             stats["calls"] += info["calls"]
             stats["prompt_tokens"] += info["prompt_tokens"]
@@ -106,17 +112,26 @@ def classify(client, pairs, out_path, demos=None, workers=32):
                 done[rec["Pair ID"]] = rec
         return rec
 
-    todo = [r for r in pairs.to_dict("records") if r["Pair ID"] not in done]
+    def run(rows, sampling=None):
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(one, r, sampling) for r in rows]
+            for i, f in enumerate(as_completed(futs), 1):
+                f.result()
+                if i % max(1, len(rows) // 20) == 0 or i == len(rows):
+                    print(f"[classify] {i}/{len(rows)} | {time.time() - t0:.0f}s", flush=True)
+
+    rows = pairs.to_dict("records")
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(one, r) for r in todo]
-        for i, f in enumerate(as_completed(futs), 1):
-            f.result()
-            if i % max(1, len(todo) // 20) == 0 or i == len(todo):
-                print(f"[classify] {i}/{len(todo)} | {time.time() - t0:.0f}s", flush=True)
+    run([r for r in rows if r["Pair ID"] not in done])
+    left = [r for r in rows if r["Pair ID"] not in done]
+    if left and rescue_sampling:
+        print(f"{len(left)} pairs got no answer; one more try with {rescue_sampling}")
+        run(left, rescue_sampling)
     fh.close()
     preds = [done.get(pid, {}).get("pred") for pid in pairs["Pair ID"]]
     stats.update(n_pairs=len(pairs), n_failed=sum(p is None for p in preds),
+                 n_rescued=sum(bool(done.get(pid, {}).get("rescued")) for pid in pairs["Pair ID"]),
+                 rescue_sampling=rescue_sampling,
                  seconds=round(time.time() - t0, 1), prompt_version=PROMPT_VERSION,
                  n_demonstrations=0 if demos is None else len(demos),
                  demonstration_ids=[] if demos is None else list(demos["Pair ID"]))
