@@ -38,7 +38,38 @@ if REPO_DIR not in sys.path:
 from config.runs import RUNS, get_run, describe
 
 LABEL_NAMES = ["Dissimilar", "Low similar", "Similar", "High similar", "Identical"]
+BINARY_NAMES = ["Dissimilar", "Similar"]
 DEFAULT_SEED = 42
+
+
+def binary_metrics(true, pred, n_balanced=30, seed=0):
+    """Le Nir et al. (2026)'s scoring: Similar (any of the four similarity levels) vs
+    Dissimilar; F1, recall, specificity and precision of the Similar class. Reported on
+    the test set as it is, and averaged over n_balanced balanced test sets (every
+    Similar pair plus as many Dissimilar pairs drawn at random), since they evaluate on
+    class-balanced data. Takes 5-level or 0/1 labels alike: level >= 1 is Similar."""
+    import numpy as np
+    y = (np.asarray(true) >= 1).astype(int)
+    p = (np.asarray(pred) >= 1).astype(int)
+
+    def score(y, p):
+        tp, fp = int(((y == 1) & (p == 1)).sum()), int(((y == 0) & (p == 1)).sum())
+        fn, tn = int(((y == 1) & (p == 0)).sum()), int(((y == 0) & (p == 0)).sum())
+        rec, spec = tp / max(tp + fn, 1), tn / max(tn + fp, 1)
+        prec = tp / max(tp + fp, 1)
+        return {"f1": 2 * prec * rec / max(prec + rec, 1e-12), "recall": rec,
+                "specificity": spec, "precision": prec}
+
+    pos, neg = np.where(y == 1)[0], np.where(y == 0)[0]
+    out = {"natural": score(y, p), "n_similar": len(pos), "n_dissimilar": len(neg)}
+    if len(pos) and len(neg) >= len(pos):
+        rng = np.random.default_rng(seed)
+        runs = [score(y[i], p[i]) for i in
+                (np.r_[pos, rng.choice(neg, len(pos), replace=False)] for _ in range(n_balanced))]
+        out["balanced"] = {k: float(np.mean([r[k] for r in runs])) for k in runs[0]}
+        out["balanced_std"] = {k: float(np.std([r[k] for r in runs])) for k in runs[0]}
+        out["n_balanced"] = n_balanced
+    return out
 
 
 # --------------------------------------------------------------------------- data
@@ -202,7 +233,8 @@ def run_experiment(run_id, data_root=None, out_root=".", seed=DEFAULT_SEED, smok
         dm = DataManager(input_root=data_root, work_dir=scratch, config_data=CONFIG_DATA,
                          tokenizer=tokenizer, seed_worker=seed_worker,
                          data_generator=generator, random_seed=seed, rebalance=False,
-                         variant=spec["variant"], build_for=build_for)
+                         variant=spec["variant"], build_for=build_for,
+                         binary=spec.get("binary", False))
         # An empty cell that became the text "nan" trained run 13 on "Nature: nan | Use: nan";
         # stop before training if any input still carries one.
         for split, d in zip(("train", "val", "test"), dm.get_data()):
@@ -215,6 +247,10 @@ def run_experiment(run_id, data_root=None, out_root=".", seed=DEFAULT_SEED, smok
     extra = {}
     logits = None
     family = spec["family"]
+    # 5 ordinal levels; 2 for a run with binary=True (Similar vs Dissimilar, as Le Nir et al.)
+    n_classes = 2 if spec.get("binary") else 5
+    if n_classes == 2 and family != "multi":
+        raise ValueError("binary=True is implemented for the multi family only")
 
     if family == "xgboost":
         from model import train_xgboost
@@ -300,7 +336,7 @@ def run_experiment(run_id, data_root=None, out_root=".", seed=DEFAULT_SEED, smok
                          if loss["loss_type"] == "ce" else None)
 
         model, _ = get_model(model_type="multi_task", model_name=spec["model"],
-                             num_classes=5, num_product_classes=dm.NUM_PRODUCT_CLASSES,
+                             num_classes=n_classes, num_product_classes=dm.NUM_PRODUCT_CLASSES,
                              device=device, class_weights=class_weights, tokenizer=tokenizer,
                              **loss)
         assert model.get_input_embeddings().num_embeddings >= len(tokenizer)
@@ -497,9 +533,12 @@ def run_experiment(run_id, data_root=None, out_root=".", seed=DEFAULT_SEED, smok
     true = np.asarray(true).astype(int)
     preds = np.asarray(preds).astype(int)
     result_df = build_result_df(df_test, true, preds)
+    if "label_5" in df_test.columns:
+        result_df["label_5"] = df_test["label_5"].values      # binary run: the level it collapsed
     result_df.to_csv(os.path.join(results_dir, f"{tag}_preds.csv"), index=False)
     m = get_stats(result_df, fig_prefix=os.path.join(results_dir, f"cm_{tag}"),
-                  return_metrics=True)
+                  return_metrics=True, num_classes=n_classes)
+    names = BINARY_NAMES if n_classes == 2 else LABEL_NAMES
 
     record = {
         "run_id": run_id, "tag": tag, "smoke": smoke, "seed": seed, **spec,
@@ -508,7 +547,9 @@ def run_experiment(run_id, data_root=None, out_root=".", seed=DEFAULT_SEED, smok
         "accuracy": m["accuracy"], "precision_macro": m["precision_macro"],
         "recall_macro": m["recall_macro"], "adjacent_acc": m["adjacent_acc"],
         "severe_rate": m["severe_rate"],
-        "per_class": [{**r, "name": LABEL_NAMES[r["class"]]} for r in m["per_class"]],
+        "per_class": [{**r, "name": names[r["class"]]} for r in m["per_class"]],
+        "n_classes": n_classes,
+        "binary": binary_metrics(true, preds),
         "confusion_matrix": m["confusion_matrix"].tolist(),
         "train_seconds": round(time.time() - t0, 1),
         "environment": env, "settings": extra,
@@ -530,6 +571,9 @@ def run_experiment(run_id, data_root=None, out_root=".", seed=DEFAULT_SEED, smok
           f"QWK {m['qwk']:.4f} | MAE {m['mae']:.4f} | n={len(df_test)} | "
           f"{record['train_seconds']/60:.1f} min")
     print("per-class F1: " + " / ".join(f"{r['f1']*100:.2f}" for r in m["per_class"]))
+    b = record["binary"]
+    print(f"binary (Le Nir): F1 {b['natural']['f1']:.4f} on the test set"
+          + (f", {b['balanced']['f1']:.4f} on {b['n_balanced']} balanced test sets" if "balanced" in b else ""))
     print("=" * 78)
     return record
 

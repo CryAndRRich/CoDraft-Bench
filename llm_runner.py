@@ -314,6 +314,8 @@ def check(data_root=None, tmp_dir=None):
     n = 0
     for f in sorted(glob.glob(os.path.join(REPO_DIR, "weights", "*", "*_metrics.json"))):
         r = json.load(open(f))
+        if r.get("n_classes", 5) != 5:
+            continue          # metrics.stats is the 5-level scoring; the binary run is not
         p = pd.read_csv(f.replace("_metrics.json", "_preds.csv"))
         m = stats(p["label"], p["pred"])
         for k in ("f1_macro", "qwk", "mae", "accuracy", "precision_macro", "recall_macro",

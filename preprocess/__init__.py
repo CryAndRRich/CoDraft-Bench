@@ -25,6 +25,7 @@ class DataManager:
                  tokenizer=None,
                  rebalance=False,
                  variant: str = "codraft",
+                 binary: bool = False,
                  build_for=None,
                  train_file: str = "train.csv",
                  val_file: str = "val.csv",
@@ -37,6 +38,10 @@ class DataManager:
         The three are row-aligned on Pair ID, so any two can be compared pair by pair.
         Pass variant=None to read the files straight from input_root.
 
+        binary: collapse the label to Similar (any of the four similarity levels) vs
+            Dissimilar, the target of Le Nir et al. (2026). label_score becomes 0/1 and the
+            5-level label is kept in label_5.
+
         build_for: which pipelines to build -- "multi_task", "cross_encoder", "ml",
             "siamese", or a list of them. None (the default) builds all four, which is
             what the original did.
@@ -44,6 +49,7 @@ class DataManager:
         
         self.INPUT_ROOT = os.path.join(input_root, variant) if variant else input_root
         self.variant = variant
+        self.binary = binary
         self.WORK_DIR = work_dir
         self.SEED_WORKER = seed_worker
         self.DATA_GENERATOR = data_generator
@@ -120,6 +126,10 @@ class DataManager:
         self.df_train = preprocess(self.df_train)
         self.df_val = preprocess(self.df_val)
         self.df_test = preprocess(self.df_test)
+        if self.binary:
+            for d in (self.df_train, self.df_val, self.df_test):
+                d["label_5"] = d["label_score"]
+                d["label_score"] = (d["label_score"] >= 1).astype(int)
     
     def _rebalance(self) -> None:
         df_0 = self.df_train[self.df_train['label_score'] == 0]

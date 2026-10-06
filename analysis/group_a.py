@@ -45,6 +45,8 @@ def load_runs():
     runs = {}
     for f in sorted(glob.glob(os.path.join(WEIGHTS, "[0-9][0-9]_*", "*_metrics.json"))):
         r = json.load(open(f))
+        if r.get("n_classes", 5) != 5:
+            continue          # the binary run (25): its labels and logits are 2-way
         tag = r["tag"]
         d = os.path.dirname(f)
         p = pd.read_csv(os.path.join(d, f"{tag}_preds.csv"))

@@ -13,7 +13,9 @@ from ..loss.RankAwareFocalLoss import RankAwareFocalLoss
 class JointClassSimBGE(XLMRobertaPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
-        self.num_labels = 5
+        # 5 ordinal levels, or 2 for the binary target (run 25). Checkpoints saved before
+        # this was read from the config all carry a 5-entry id2label, so they load as 5.
+        self.num_labels = config.num_labels
         self.num_product_classes = config.num_product_classes
 
         self.mask_token_id = getattr(config, "mask_token_id", 250001)

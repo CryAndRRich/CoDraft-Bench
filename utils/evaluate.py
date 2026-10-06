@@ -24,8 +24,8 @@ def get_preds_multi(trainer, test_ds, df_test, save_logits=None, return_logits=F
     """Predict with the multi-task model.
 
     create_patterns duplicates every row (one copy masks side 1, one masks side 2),
-    so the logits are reshaped to (-1, 2, 5) and averaged. This requires the test
-    order to be preserved, i.e. no shuffling.
+    so the logits are reshaped to (-1, 2, n_classes) and averaged. This requires the
+    test order to be preserved, i.e. no shuffling.
 
     save_logits: path to write the averaged logits to (.npy). Saving them means the
     calibration and risk-coverage analyses can be run later without re-predicting.
@@ -37,7 +37,7 @@ def get_preds_multi(trainer, test_ds, df_test, save_logits=None, return_logits=F
     if isinstance(predictions, tuple):
         predictions = predictions[0]
 
-    reshaped_logits = predictions.reshape(-1, 2, 5)
+    reshaped_logits = predictions.reshape(-1, 2, predictions.shape[-1])
     avg_logits = reshaped_logits.mean(axis=1)
 
     if len(predictions) != 2 * len(df_test):
@@ -45,7 +45,7 @@ def get_preds_multi(trainer, test_ds, df_test, save_logits=None, return_logits=F
             f"got {len(predictions)} prediction rows for {len(df_test)} test pairs; "
             f"expected exactly twice that, since create_patterns writes two masked "
             f"copies of every pair. A shuffled or padded eval loader breaks the "
-            f"pairing that the (-1, 2, 5) reshape relies on."
+            f"pairing that the (-1, 2, n_classes) reshape relies on."
         )
     if len(avg_logits) != len(df_test):
         raise ValueError(
@@ -122,19 +122,22 @@ def compute_metrics(eval_pred):
 def safe_div(a, b):
     return float(a) / float(b) if b else 0.0
 
-def get_stats(df, fig_prefix="confusion_matrix", return_metrics=False):
+def get_stats(df, fig_prefix="confusion_matrix", return_metrics=False, num_classes=5):
     """Per-class and overall metrics for a (label, pred) frame.
 
     fig_prefix: figure stem, so each run writes its own file instead of
     overwriting the previous one.
     return_metrics: return every metric as a dict, including the macro-F1 and the
     per-class table, which used to be printed and then discarded.
+    num_classes: 5 for the ordinal levels, 2 for the binary target, so the macro
+    averages run over the classes that exist.
     """
     y_true = df["label"].to_numpy()
     y_pred = df["pred"].to_numpy()
 
-    labels = list(range(5))
-    label_names = ['Dissimilar (0)', 'Low (1)', 'Similar (2)', 'High (3)', 'Identical (4)']
+    labels = list(range(num_classes))
+    label_names = (['Dissimilar (0)', 'Low (1)', 'Similar (2)', 'High (3)', 'Identical (4)']
+                   if num_classes == 5 else ['Dissimilar (0)', 'Similar (1)'])
     K = len(labels)
     idx = {c: i for i, c in enumerate(labels)}
 

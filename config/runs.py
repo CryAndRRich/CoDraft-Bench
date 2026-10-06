@@ -20,6 +20,7 @@ Multi-task overrides (only on the "multi" family):
   aux_weight  lambda in the paper; 0 switches the masked class head off
   loss_type   "rank_aware" (focal + alpha * rank MSE) or "ce" (class-weighted CE)
   alpha       weight of the rank penalty inside the rank-aware loss
+  binary      True: train on Similar vs Dissimilar (2 classes) instead of the 5 levels
 """
 
 DEBERTA = "microsoft/deberta-v3-base"
@@ -108,6 +109,15 @@ RUNS = {
              table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Llama-3.1-8B"),
     24: dict(name="multi_codraft_nemotron-nano-8b", family="multi", model=BGE_RERANKER, variant="codraft_nemotron-nano-8b",
              table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Nemotron-Nano-8B"),
+
+    # ---- the binary target of Le Nir et al. (2026) ---------------------------------------
+    # Run 7 with the label collapsed before training: Similar (any of the four similarity
+    # levels) vs Dissimilar, a 2-way head. Everything else is run 7's (input, backbone,
+    # masked NICE head, rank-aware focal loss). Scored as Le Nir et al. score: F1 of the
+    # Similar class, on the test set and on balanced test sets (metrics JSON, "binary").
+    25: dict(name="multi_codraft_binary",   family="multi",   model=BGE_RERANKER, variant="codraft",
+             binary=True,
+             table="Le Nir", row="Multi-Task Cross-Encoder w/ CoDraft, trained on the binary target"),
 }
 
 
