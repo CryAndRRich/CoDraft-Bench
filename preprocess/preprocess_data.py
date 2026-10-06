@@ -2,77 +2,45 @@ import pandas as pd
 
 from config.config_data import CONFIG_DATA
 
-def _given(value):
-    # An empty CSV cell reads as NaN, which is truthy and prints as "nan"; without this the
-    # category variant's blanked Nature/Purpose became "Nature: nan | Use: nan".
+LABEL_MAPPING = {"Dissimilar": 0, "Low similar": 1, "Similar": 2, "High similar": 3, "Identical": 4}
+
+
+def _given(value: object) -> bool:
     return not pd.isna(value) and bool(str(value).strip())
 
-def create_structured_text_enhanced(term, nature, purpose, class_id, nice_class_map):
-    text = str(term).strip()
-    context_parts = []
+
+def create_structured_text_enhanced(
+    term: str, nature: object, purpose: object, class_id: int
+) -> str:
+    parts = []
     if _given(nature):
-        context_parts.append(f"Nature: {str(nature).strip()}")
+        parts.append(f"Nature: {str(nature).strip()}")
     if _given(purpose):
-        context_parts.append(f"Use: {str(purpose).strip()}")
-    if class_id:
-        try:
-            c_id = int(str(class_id))
-            class_desc = nice_class_map.get(c_id, "")
-            if class_desc:
-                context_parts.append(f"Category: {class_desc}")
-        except:
-            pass
-        
-    if context_parts:
-        full_text = f"{text} [ {' | '.join(context_parts)} ]"
-    else:
-        full_text = text
-    return full_text
+        parts.append(f"Use: {str(purpose).strip()}")
+    heading = CONFIG_DATA.NICE_CLASS_MAP.get(int(class_id), "")
+    if heading:
+        parts.append(f"Category: {heading}")
+    text = str(term).strip()
+    return f"{text} [ {' | '.join(parts)} ]" if parts else text
 
-def preprocess(df):
-    label_mapping = {
-        'Dissimilar': 0,
-        'Low similar': 1,
-        'Similar': 2,
-        'High similar': 3,
-        'Identical': 4
-    }
-    df['label_score'] = df['Similarity'].map(label_mapping)
-    df = df.dropna(subset=['label_score'])
-    df['label_score'] = df['label_score'].astype(int)
-    
-    # The expanded variant carries the LLM-rewritten name instead of Nature/Purpose.
-    if 'Term 1 Expand' in df.columns and 'Term 2 Expand' in df.columns:
-        df['input_text_1'] = df['Term 1 Expand'].astype(str).str.strip()
-        df['input_text_2'] = df['Term 2 Expand'].astype(str).str.strip()
-        return df
 
-    if 'Nature 1' in df.columns or 'Purpose 1' in df.columns:
-        df['input_text_1'] = df.apply(
-            lambda x: create_structured_text_enhanced(
-                x['Term 1'], 
-                x.get('Nature 1', ''),  
-                x.get('Purpose 1', ''),
-                x.get('Class 1', ''),
-                CONFIG_DATA.NICE_CLASS_MAP
-            ),
-            axis=1
-        )
-    else:
-        df['input_text_1'] = df['Term 1'].astype(str).str.strip()
-
-    if 'Nature 2' in df.columns or 'Purpose 2' in df.columns:
-        df['input_text_2'] = df.apply(
-            lambda x: create_structured_text_enhanced(
-                x['Term 2'], 
-                x.get('Nature 2', ''), 
-                x.get('Purpose 2', ''), 
-                x.get('Class 2', ''), 
-                CONFIG_DATA.NICE_CLASS_MAP
-            ),
-            axis=1
-        )
-    else:
-        df['input_text_2'] = df['Term 2'].astype(str).str.strip()
-        
+def preprocess(df: pd.DataFrame) -> pd.DataFrame:
+    df["label_score"] = df["Similarity"].map(LABEL_MAPPING)
+    df = df.dropna(subset=["label_score"])
+    df["label_score"] = df["label_score"].astype(int)
+    for side in ("1", "2"):
+        if f"Term {side} Expand" in df.columns:
+            df[f"input_text_{side}"] = df[f"Term {side} Expand"].astype(str).str.strip()
+        elif f"Nature {side}" in df.columns:
+            df[f"input_text_{side}"] = [
+                create_structured_text_enhanced(t, n, p, c)
+                for t, n, p, c in zip(
+                    df[f"Term {side}"],
+                    df[f"Nature {side}"],
+                    df[f"Purpose {side}"],
+                    df[f"Class {side}"],
+                )
+            ]
+        else:
+            df[f"input_text_{side}"] = df[f"Term {side}"].astype(str).str.strip()
     return df

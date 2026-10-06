@@ -1,139 +1,256 @@
-"""Every experiment in the paper, keyed by run ID.
-
-The notebook only picks an ID; everything that distinguishes one run from another lives
-here, so two runs can differ only in what this table says they differ in.
-
-family      what trains it
-  xgboost   TF-IDF features + XGBoost (CPU or GPU)
-  cross     sentence-transformers CrossEncoder
-  bi        bi-encoder (dense retriever) + classifier over [u, v, |u - v|]
-  multi     the Multi-Task Cross-Encoder (JointClassSimBGE)
-
-variant     which data/<variant>/ split the model reads
-  codraft   name + LLM Nature/Purpose + NICE heading   (the full input)
-  plain     the bare product name
-  category  name + NICE heading, Nature/Purpose blanked
-  expanded  the LLM-rewritten name
-  codraft_<llm>  as codraft, with the attributes from another LLM (scripts/llm.ipynb)
-
-Multi-task overrides (only on the "multi" family):
-  aux_weight  lambda in the paper; 0 switches the masked class head off
-  loss_type   "rank_aware" (focal + alpha * rank MSE) or "ce" (class-weighted CE)
-  alpha       weight of the rank penalty inside the rank-aware loss
-  binary      True: train on Similar vs Dissimilar (2 classes) instead of the 5 levels
-"""
-
 DEBERTA = "microsoft/deberta-v3-base"
 BGE_RERANKER = "BAAI/bge-reranker-v2-m3"
 BGE_M3 = "BAAI/bge-m3"
 LEGAL_BERT = "nlpaueb/legal-bert-base-uncased"
 
 RUNS = {
-    # ---- Table 2: every baseline with and without CoDraft ------------------------
-    1:  dict(name="xgboost_plain",         family="xgboost", model=None,         variant="plain",
-             table="Table 2", row="XGBoost via TF-IDF (vanilla)"),
-    2:  dict(name="xgboost_codraft",       family="xgboost", model=None,         variant="codraft",
-             table="Table 2", row="XGBoost via TF-IDF (w/ CoDraft)"),
-    3:  dict(name="ce_deberta_plain",      family="cross",   model=DEBERTA,      variant="plain",
-             table="Table 2", row="Cross-Encoder deberta (vanilla); also Fig. 4A"),
-    4:  dict(name="ce_deberta_codraft",    family="cross",   model=DEBERTA,      variant="codraft",
-             table="Table 2", row="Cross-Encoder deberta (w/ CoDraft)"),
-    5:  dict(name="ce_bge_codraft",        family="cross",   model=BGE_RERANKER, variant="codraft",
-             table="Table 2", row="Cross-Encoder, same backbone as ours (Reviewer 2)"),
-    6:  dict(name="ce_bge_plain",          family="cross",   model=BGE_RERANKER, variant="plain",
-             table="Table 2", row="Cross-Encoder, same backbone as ours (vanilla)"),
-    7:  dict(name="multi_codraft",         family="multi",   model=BGE_RERANKER, variant="codraft",
-             table="Table 2/3", row="Multi-Task Cross-Encoder, full model; also Fig. 3 and 4B"),
-
-    # ---- baselines Reviewer 3 named -------------------------------------------------
-    8:  dict(name="bi_bgem3_plain",        family="bi",      model=BGE_M3,       variant="plain",
-             table="Table 2", row="Bi-encoder / dense retriever (vanilla)"),
-    9:  dict(name="bi_bgem3_codraft",      family="bi",      model=BGE_M3,       variant="codraft",
-             table="Table 2", row="Bi-encoder / dense retriever (w/ CoDraft)"),
-    10: dict(name="ce_legalbert_plain",    family="cross",   model=LEGAL_BERT,   variant="plain",
-             table="Table 2", row="Cross-Encoder legal-BERT (vanilla)"),
-    11: dict(name="ce_legalbert_codraft",  family="cross",   model=LEGAL_BERT,   variant="codraft",
-             table="Table 2", row="Cross-Encoder legal-BERT (w/ CoDraft)"),
-
-    # ---- Table 3: ablations of the full model (run 7) ----------------------------
-    12: dict(name="multi_plain",           family="multi",   model=BGE_RERANKER, variant="plain",
-             table="Table 3", row="w/o CoDraft Enrichment"),
-    13: dict(name="multi_category",        family="multi",   model=BGE_RERANKER, variant="category",
-             table="Table 3", row="Term + NICE heading only (is the gain the free lookup?)"),
-    14: dict(name="multi_expanded",        family="multi",   model=BGE_RERANKER, variant="expanded",
-             table="Table 3", row="free-text rewrite instead of Nature/Purpose (is the schema needed?)"),
-    15: dict(name="multi_codraft_noaux",   family="multi",   model=BGE_RERANKER, variant="codraft",
-             aux_weight=0.0,
-             table="Table 3", row="w/o Multi-Task Head"),
-    16: dict(name="multi_codraft_ce",      family="multi",   model=BGE_RERANKER, variant="codraft",
-             loss_type="ce",
-             table="Table 3", row="w/o Rank-Aware Loss (class-weighted CE)"),
-    17: dict(name="multi_codraft_alpha0",  family="multi",   model=BGE_RERANKER, variant="codraft",
-             alpha=0.0,
-             table="Table 3", row="focal loss only, no rank penalty"),
-
-    # ---- added after the first 17 runs ------------------------------------------------
-    # Removing the masked head (15) or the rank-aware loss (16) alone costs no macro-F1,
-    # yet the full model beats a plain cross-encoder on the same backbone (5) by +4.7.
-    # This run removes both, leaving a plain cross-encoder trained with the multi-task
-    # recipe (two masked views averaged at test time, class tokens, 10 epochs, cosine
-    # schedule). If it matches run 7, the gap is the recipe, not the architecture.
-    18: dict(name="multi_codraft_noaux_ce", family="multi",  model=BGE_RERANKER, variant="codraft",
-             aux_weight=0.0, loss_type="ce",
-             table="Table 3", row="neither head nor rank-aware loss: the multi-task recipe alone"),
-    # Inference only: run 7's trained model on test inputs with parts of the enrichment
-    # removed or shuffled. Says which part of the input the model actually relies on.
-    # Needs run 7's checkpoint (weights/07_multi_codraft_seed42/model) available locally or
-    # attached on Kaggle as a dataset.
-    19: dict(name="probe_run07_inputs",    family="probe",   model=BGE_RERANKER, variant="codraft",
-             source="07_multi_codraft_seed42",
-             table="Analysis", row="run 7 at test time with Nature / Purpose / heading removed or shuffled"),
-    # Le Nir et al. (2026)'s best design, re-headed to five classes: frozen sentence
-    # embeddings of both names, one-hot NICE classes and a same-class flag, into an
-    # MLP 1024-512-256. The direct rival to CoDraft: taxonomy as one-hot categoricals
-    # instead of LLM-generated attributes.
-    20: dict(name="hybrid_mlp_bgem3_plain", family="hybrid", model=BGE_M3,       variant="plain",
-             table="Table 2", row="Hybrid MLP (P1): embeddings + one-hot NICE classes"),
-
-    # ---- run 7 with the CoDraft attributes from an open LLM instead of Gemini ----------
-    # Same pipeline as the paper, only f_LLM differs: scripts/llm.ipynb (TASK "enrich") ran
-    # the same prompt and schema, and data/codraft_<llm>/ joins its Nature / Purpose to the
-    # pairs by the rule that built data/codraft/ (llm_runner.py --check). Every setting is
-    # run 7's, so each run compares with run 7 pair by pair. On Kaggle, the codraft_<llm>/
-    # folders must be in an attached dataset; the runner finds them under /kaggle/input.
-    21: dict(name="multi_codraft_qwen2.5-7b",   family="multi", model=BGE_RERANKER, variant="codraft_qwen2.5-7b",
-             table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Qwen2.5-7B"),
-    22: dict(name="multi_codraft_qwen3-8b",     family="multi", model=BGE_RERANKER, variant="codraft_qwen3-8b",
-             table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Qwen3-8B"),
-    23: dict(name="multi_codraft_llama3.1-8b",  family="multi", model=BGE_RERANKER, variant="codraft_llama3.1-8b",
-             table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Llama-3.1-8B"),
-    24: dict(name="multi_codraft_nemotron-nano-8b", family="multi", model=BGE_RERANKER, variant="codraft_nemotron-nano-8b",
-             table="Robustness", row="Multi-Task Cross-Encoder, CoDraft by Nemotron-Nano-8B"),
-
-    # ---- the binary target of Le Nir et al. (2026) ---------------------------------------
-    # Run 7 with the label collapsed before training: Similar (any of the four similarity
-    # levels) vs Dissimilar, a 2-way head. Everything else is run 7's (input, backbone,
-    # masked NICE head, rank-aware focal loss). Scored as Le Nir et al. score: F1 of the
-    # Similar class, on the test set and on balanced test sets (metrics JSON, "binary").
-    25: dict(name="multi_codraft_binary",   family="multi",   model=BGE_RERANKER, variant="codraft",
-             binary=True,
-             table="Le Nir", row="Multi-Task Cross-Encoder w/ CoDraft, trained on the binary target"),
+    1: dict(
+        name="xgboost_plain",
+        family="xgboost",
+        model=None,
+        variant="plain",
+        table="Table 2",
+        row="XGBoost via TF-IDF (vanilla)",
+        path="baselines/xgboost-tfidf_plain",
+    ),
+    2: dict(
+        name="xgboost_codraft",
+        family="xgboost",
+        model=None,
+        variant="codraft",
+        table="Table 2",
+        row="XGBoost via TF-IDF (w/ CoDraft)",
+        path="baselines/xgboost-tfidf_codraft",
+    ),
+    3: dict(
+        name="ce_deberta_plain",
+        family="cross",
+        model=DEBERTA,
+        variant="plain",
+        table="Table 2",
+        row="Cross-Encoder deberta (vanilla); also Fig. 4A",
+        path="baselines/cross-encoder_deberta-v3-base_plain",
+    ),
+    4: dict(
+        name="ce_deberta_codraft",
+        family="cross",
+        model=DEBERTA,
+        variant="codraft",
+        table="Table 2",
+        row="Cross-Encoder deberta (w/ CoDraft)",
+        path="baselines/cross-encoder_deberta-v3-base_codraft",
+    ),
+    5: dict(
+        name="ce_bge_codraft",
+        family="cross",
+        model=BGE_RERANKER,
+        variant="codraft",
+        table="Table 2",
+        row="Cross-Encoder, same backbone as ours (Reviewer 2)",
+        path="baselines/cross-encoder_bge-reranker-v2-m3_codraft",
+    ),
+    6: dict(
+        name="ce_bge_plain",
+        family="cross",
+        model=BGE_RERANKER,
+        variant="plain",
+        table="Table 2",
+        row="Cross-Encoder, same backbone as ours (vanilla)",
+        path="baselines/cross-encoder_bge-reranker-v2-m3_plain",
+    ),
+    7: dict(
+        name="multi_codraft",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft",
+        table="Table 2/3",
+        row="Multi-Task Cross-Encoder, full model; also Fig. 3 and 4B",
+        path="codraft",
+    ),
+    8: dict(
+        name="bi_bgem3_plain",
+        family="bi",
+        model=BGE_M3,
+        variant="plain",
+        table="Table 2",
+        row="Bi-encoder / dense retriever (vanilla)",
+        path="baselines/bi-encoder_bge-m3_plain",
+    ),
+    9: dict(
+        name="bi_bgem3_codraft",
+        family="bi",
+        model=BGE_M3,
+        variant="codraft",
+        table="Table 2",
+        row="Bi-encoder / dense retriever (w/ CoDraft)",
+        path="baselines/bi-encoder_bge-m3_codraft",
+    ),
+    10: dict(
+        name="ce_legalbert_plain",
+        family="cross",
+        model=LEGAL_BERT,
+        variant="plain",
+        table="Table 2",
+        row="Cross-Encoder legal-BERT (vanilla)",
+        path="baselines/cross-encoder_legal-bert_plain",
+    ),
+    11: dict(
+        name="ce_legalbert_codraft",
+        family="cross",
+        model=LEGAL_BERT,
+        variant="codraft",
+        table="Table 2",
+        row="Cross-Encoder legal-BERT (w/ CoDraft)",
+        path="baselines/cross-encoder_legal-bert_codraft",
+    ),
+    12: dict(
+        name="multi_plain",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="plain",
+        table="Table 3",
+        row="w/o CoDraft Enrichment",
+        path="ablations/no-codraft-enrichment",
+    ),
+    13: dict(
+        name="multi_category",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="category",
+        table="Table 3",
+        row="Term + NICE heading only (is the gain the free lookup?)",
+        path="ablations/no-llm-attributes",
+    ),
+    14: dict(
+        name="multi_expanded",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="expanded",
+        table="Table 3",
+        row="free-text rewrite instead of Nature/Purpose (is the schema needed?)",
+        path="ablations/free-text-expansion",
+    ),
+    15: dict(
+        name="multi_codraft_noaux",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft",
+        aux_weight=0.0,
+        table="Table 3",
+        row="w/o Multi-Task Head",
+        path="ablations/no-multitask-head",
+    ),
+    16: dict(
+        name="multi_codraft_ce",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft",
+        loss_type="ce",
+        table="Table 3",
+        row="w/o Rank-Aware Loss (class-weighted CE)",
+        path="ablations/no-rank-aware-loss",
+    ),
+    17: dict(
+        name="multi_codraft_alpha0",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft",
+        alpha=0.0,
+        table="Table 3",
+        row="focal loss only, no rank penalty",
+        path="ablations/no-rank-penalty",
+    ),
+    18: dict(
+        name="multi_codraft_noaux_ce",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft",
+        aux_weight=0.0,
+        loss_type="ce",
+        table="Table 3",
+        row="neither head nor rank-aware loss: the multi-task recipe alone",
+        path="ablations/no-head-no-rank-aware-loss",
+    ),
+    19: dict(
+        name="probe_run07_inputs",
+        family="probe",
+        model=BGE_RERANKER,
+        variant="codraft",
+        source=7,
+        table="Analysis",
+        row="run 7 at test time with Nature / Purpose / heading removed or shuffled",
+        path="ablations/input-probe",
+    ),
+    20: dict(
+        name="hybrid_mlp_bgem3_plain",
+        family="hybrid",
+        model=BGE_M3,
+        variant="plain",
+        table="Table 2",
+        row="Hybrid MLP (P1): embeddings + one-hot NICE classes",
+        path="baselines/hybrid-mlp_bge-m3_plain",
+    ),
+    21: dict(
+        name="multi_codraft_qwen2.5-7b",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft_qwen2.5-7b",
+        table="Robustness",
+        row="Multi-Task Cross-Encoder, CoDraft by Qwen2.5-7B",
+        path="enrichment-llms/qwen2.5-7b",
+    ),
+    22: dict(
+        name="multi_codraft_qwen3-8b",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft_qwen3-8b",
+        table="Robustness",
+        row="Multi-Task Cross-Encoder, CoDraft by Qwen3-8B",
+        path="enrichment-llms/qwen3-8b",
+    ),
+    23: dict(
+        name="multi_codraft_llama3.1-8b",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft_llama3.1-8b",
+        table="Robustness",
+        row="Multi-Task Cross-Encoder, CoDraft by Llama-3.1-8B",
+        path="enrichment-llms/llama3.1-8b",
+    ),
+    24: dict(
+        name="multi_codraft_nemotron-nano-8b",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft_nemotron-nano-8b",
+        table="Robustness",
+        row="Multi-Task Cross-Encoder, CoDraft by Nemotron-Nano-8B",
+        path="enrichment-llms/nemotron-nano-8b",
+    ),
+    25: dict(
+        name="multi_codraft_binary",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft",
+        binary=True,
+        table="Le Nir",
+        row="Multi-Task Cross-Encoder w/ CoDraft, trained on the binary target",
+        path="binary/codraft_binary-trained",
+    ),
 }
 
 
-def get_run(run_id):
+def get_run(run_id: int) -> dict:
     if run_id not in RUNS:
-        raise KeyError(f"unknown run {run_id}; valid IDs are {sorted(RUNS)}")
-    spec = dict(RUNS[run_id])
-    spec["id"] = run_id
-    return spec
+        raise KeyError(f"Unknown run {run_id}. Valid IDs are {sorted(RUNS)}.")
+    return {**RUNS[run_id], "id": run_id}
 
 
-def describe():
-    """The run table, for printing at the top of the notebook."""
+def describe() -> str:
     lines = [f"{'ID':>3}  {'name':24s} {'family':8s} {'variant':9s} {'table':10s} row"]
-    for i in sorted(RUNS):
-        r = RUNS[i]
-        lines.append(f"{i:>3}  {r['name']:24s} {r['family']:8s} {r['variant']:9s} "
-                     f"{r['table']:10s} {r['row']}")
+    for run_id in sorted(RUNS):
+        run = RUNS[run_id]
+        lines.append(
+            f"{run_id:>3}  {run['name']:24s} {run['family']:8s} {run['variant']:9s} "
+            f"{run['table']:10s} {run['row']}"
+        )
     return "\n".join(lines)

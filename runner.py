@@ -1,187 +1,155 @@
-"""Run one experiment from config/runs.py, end to end.
-
-    python runner.py --run-id 7 --data-root data --out-root .
-    python runner.py --list
-
-Every run uses one GPU, so all of them see the same hardware and the same optimisation
-settings. The notebook can launch two runs side by side, one per GPU of a T4 x2 machine,
-through launch(); each still runs alone on its own card.
-
-Outputs, all named after the run tag  <ID>_<name>_seed<seed>:
-    <out>/results/<tag>_preds.csv      per-example predictions, carrying Pair ID
-    <out>/results/<tag>_metrics.json   every metric, the run spec and the environment
-    <out>/results/<tag>_logits.npy     averaged logits (multi-task only)
-    <out>/results/cm_<tag>.pdf/.png    confusion matrix
-    <out>/weights/<tag>/               the trained model
-    <out>/logs/<tag>.log               the full console output (written by launch)
-"""
-import os
-
-os.environ.setdefault("MPLBACKEND", "Agg")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-# Lets cuBLAS run deterministically, which use_deterministic_algorithms asks for.
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-
 import argparse
 import glob
 import json
+import os
 import platform
+import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import zipfile
+from collections.abc import Callable
+
+from config.runs import RUNS, describe, get_run
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
-if REPO_DIR not in sys.path:
-    sys.path.insert(0, REPO_DIR)
-
-from config.runs import RUNS, get_run, describe
-
-LABEL_NAMES = ["Dissimilar", "Low similar", "Similar", "High similar", "Identical"]
-BINARY_NAMES = ["Dissimilar", "Similar"]
-DEFAULT_SEED = 42
-
-
-def binary_metrics(true, pred, n_balanced=30, seed=0):
-    """Le Nir et al. (2026)'s scoring: Similar (any of the four similarity levels) vs
-    Dissimilar; F1, recall, specificity and precision of the Similar class. Reported on
-    the test set as it is, and averaged over n_balanced balanced test sets (every
-    Similar pair plus as many Dissimilar pairs drawn at random), since they evaluate on
-    class-balanced data. Takes 5-level or 0/1 labels alike: level >= 1 is Similar."""
-    import numpy as np
-    y = (np.asarray(true) >= 1).astype(int)
-    p = (np.asarray(pred) >= 1).astype(int)
-
-    def score(y, p):
-        tp, fp = int(((y == 1) & (p == 1)).sum()), int(((y == 0) & (p == 1)).sum())
-        fn, tn = int(((y == 1) & (p == 0)).sum()), int(((y == 0) & (p == 0)).sum())
-        rec, spec = tp / max(tp + fn, 1), tn / max(tn + fp, 1)
-        prec = tp / max(tp + fp, 1)
-        return {"f1": 2 * prec * rec / max(prec + rec, 1e-12), "recall": rec,
-                "specificity": spec, "precision": prec}
-
-    pos, neg = np.where(y == 1)[0], np.where(y == 0)[0]
-    out = {"natural": score(y, p), "n_similar": len(pos), "n_dissimilar": len(neg)}
-    if len(pos) and len(neg) >= len(pos):
-        rng = np.random.default_rng(seed)
-        runs = [score(y[i], p[i]) for i in
-                (np.r_[pos, rng.choice(neg, len(pos), replace=False)] for _ in range(n_balanced))]
-        out["balanced"] = {k: float(np.mean([r[k] for r in runs])) for k in runs[0]}
-        out["balanced_std"] = {k: float(np.std([r[k] for r in runs])) for k in runs[0]}
-        out["n_balanced"] = n_balanced
-    return out
+SEED = 42
+KAGGLE_INPUT = "/kaggle/input"
+RESULT_FILES = {
+    "_preds.csv": "preds.csv",
+    "_metrics.json": "metrics.json",
+    "_logits.npy": "logits.npy",
+    "_raw.jsonl": "raw.jsonl",
+}
+PRINT_LOCK = threading.Lock()
 
 
-# --------------------------------------------------------------------------- data
+def run_tag(run_id: int, smoke: bool = False) -> str:
+    return ("SMOKE_" if smoke else "") + f"{run_id:02d}_{RUNS[run_id]['name']}_seed{SEED}"
 
-def find_data_root(hint=None):
-    """The directory holding codraft/, plain/, category/ and expanded/."""
-    def ok(d):
-        return d and os.path.isfile(os.path.join(d, "codraft", "train.csv"))
-    candidates = [hint, os.environ.get("CODRAFT_DATA"), os.path.join(REPO_DIR, "data")]
-    for c in candidates:
-        if ok(c):
-            return c
-    # Kaggle mounts datasets at different depths depending on how they were attached.
+
+def _search_kaggle(ok: Callable[[str], bool]) -> str | None:
     for depth in ("*", "*/*", "*/*/*", "*/*/*/*"):
-        for d in sorted(glob.glob(os.path.join("/kaggle/input", depth))):
+        for d in sorted(glob.glob(os.path.join(KAGGLE_INPUT, depth))):
             if ok(d):
                 return d
-    raise FileNotFoundError(
-        f"no dataset found (tried {hint!r} and /kaggle/input). Expected a directory "
-        f"containing codraft/train.csv."
-    )
+    return None
 
 
-def find_variant_root(data_root, variant, extra=()):
-    """The directory holding <variant>/, which is data_root for the four shipped variants.
+def find_data_root(hint: str | None = None) -> str:
+    def ok(d: str | None) -> bool:
+        return bool(d) and os.path.isfile(os.path.join(d, "codraft", "train.csv"))
 
-    A variant built from another LLM's attributes (codraft_<llm>/, from scripts/llm.ipynb)
-    may sit elsewhere: in one of the extra directories, or in any dataset under
-    /kaggle/input (attach the LLM notebook's output as a dataset).
-    """
-    def ok(d):
-        return d and os.path.isfile(os.path.join(d, variant, "test.csv"))
-    for c in (data_root, *extra):
-        if ok(c):
-            return c
-    for depth in ("*", "*/*", "*/*/*", "*/*/*/*"):
-        for d in sorted(glob.glob(os.path.join("/kaggle/input", depth))):
-            if ok(d):
-                return d
-    raise FileNotFoundError(f"variant {variant!r} not found in {data_root} or under /kaggle/input; "
-                            f"expected a directory containing {variant}/test.csv")
+    for d in (hint, os.environ.get("CODRAFT_DATA"), os.path.join(REPO_DIR, "data")):
+        if ok(d):
+            return d
+    found = _search_kaggle(ok)
+    if found is None:
+        raise FileNotFoundError(
+            f"No dataset found (tried {hint!r} and {KAGGLE_INPUT}). "
+            f"Expected a directory containing codraft/train.csv."
+        )
+    return found
 
 
-def find_checkpoint(source, hint=None):
-    """A trained multi-task checkpoint: the folder holding model.safetensors and config.json.
+def find_variant_root(data_root: str, variant: str, extra: tuple[str, ...] = ()) -> str:
+    def ok(d: str | None) -> bool:
+        return bool(d) and os.path.isfile(os.path.join(d, variant, "test.csv"))
 
-    Looks in weights/<source>/model locally, then anywhere under /kaggle/input (attach the
-    run's model/ folder as a Kaggle dataset). Kaggle may flatten the folder name, so a
-    multi-task checkpoint is recognised by its config rather than its path.
-    """
-    def ok(d):
-        return d and os.path.isfile(os.path.join(d, "model.safetensors")) \
-            and os.path.isfile(os.path.join(d, "config.json"))
-    for c in (hint, os.environ.get("CODRAFT_CKPT"),
-              os.path.join(REPO_DIR, "weights", source, "model"),
-              os.path.join(REPO_DIR, "weights", source)):
-        if ok(c):
-            return c
+    for d in (data_root, *extra):
+        if ok(d):
+            return d
+    found = _search_kaggle(ok)
+    if found is None:
+        raise FileNotFoundError(
+            f"Variant {variant!r} not found in {data_root} or under {KAGGLE_INPUT}. "
+            f"Expected a directory containing {variant}/test.csv."
+        )
+    return found
+
+
+def find_checkpoint(source: int) -> str:
+    path = RUNS[source]["path"]
+    tag = run_tag(source)
+
+    def ok(d: str | None) -> bool:
+        return bool(d) and all(
+            os.path.isfile(os.path.join(d, f)) for f in ("model.safetensors", "config.json")
+        )
+
+    for d in (os.environ.get("CODRAFT_CKPT"), os.path.join(REPO_DIR, "weights", path, "model")):
+        if ok(d):
+            return d
     found = []
-    if os.path.isdir("/kaggle/input"):
-        for root, _, files in os.walk("/kaggle/input"):
-            if "model.safetensors" in files and "added_tokens.json" in files and "config.json" in files:
-                try:
-                    if json.load(open(os.path.join(root, "config.json"))).get("num_product_classes"):
+    for root, _, files in os.walk(KAGGLE_INPUT):
+        if {"model.safetensors", "added_tokens.json", "config.json"} <= set(files):
+            try:
+                with open(os.path.join(root, "config.json")) as fh:
+                    if json.load(fh).get("num_product_classes"):
                         found.append(root)
-                except Exception:
-                    pass
-    named = [f for f in found if source in f]
+            except Exception:
+                pass
+    named = [f for f in found if tag in f or f.rstrip("/").endswith(os.path.join(path, "model"))]
     if len(named) == 1:
         return named[0]
     if len(found) == 1:
         return found[0]
+    candidates = f"; candidates: {found}" if found else ""
     raise FileNotFoundError(
-        f"checkpoint for {source} not found" + (f"; candidates: {found}" if found else "")
-        + f". Attach weights/{source}/model as a Kaggle dataset, or set CODRAFT_CKPT.")
+        f"Checkpoint of run {source} ({path}) not found{candidates}. "
+        f"Attach weights/{path}/model as a Kaggle dataset, or set CODRAFT_CKPT."
+    )
 
 
-def _smoke_data(data_root, variant, tmp_root):
-    """A tiny copy of one variant that still holds all five labels, for a quick check."""
+def _smoke_data(data_root: str, variant: str, tmp_root: str) -> str:
     import pandas as pd
+
     dst = os.path.join(tmp_root, variant)
     os.makedirs(dst, exist_ok=True)
-    per_class = {"train": 40, "val": 10, "test": 10}
-    for split, k in per_class.items():
+    for split, k in {"train": 40, "val": 10, "test": 10}.items():
         d = pd.read_csv(os.path.join(data_root, variant, f"{split}.csv"), low_memory=False)
         d = d.groupby("Similarity", sort=False, group_keys=False).head(k)
         d.sort_index().to_csv(os.path.join(dst, f"{split}.csv"), index=False)
     return tmp_root
 
 
-# ---------------------------------------------------------------------- one run
+def _setup_determinism(seed: int) -> object:
+    import random
+    import warnings
 
-def _setup_determinism(seed):
+    import numpy as np
     import torch
-    from utils import set_seed
-    set_seed(seed)
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    warnings.filterwarnings("ignore")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    torch.use_deterministic_algorithms(True, warn_only=True)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    g = torch.Generator()
-    g.manual_seed(seed)
-    return g
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
 
 
-def _environment():
+def _environment() -> dict:
     import torch
-    env = {"python": platform.python_version(), "torch": torch.__version__,
-           "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-           "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-           "n_gpu_visible": torch.cuda.device_count()}
+
+    env = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "n_gpu_visible": torch.cuda.device_count(),
+    }
     for pkg in ("transformers", "sentence_transformers", "xgboost", "sklearn", "datasets"):
         try:
             env[pkg] = __import__(pkg).__version__
@@ -190,578 +158,799 @@ def _environment():
     return env
 
 
-def run_experiment(run_id, data_root=None, out_root=".", seed=DEFAULT_SEED, smoke=False,
-                   save_weights=True):
+def _data_manager(ctx: dict, tokenizer: object, build_for: str) -> object:
+    from preprocess.data_manager import DataManager
+
+    dm = DataManager(
+        input_root=ctx["data_root"],
+        variant=ctx["spec"]["variant"],
+        build_for=build_for,
+        tokenizer=tokenizer,
+        binary=ctx["spec"].get("binary", False),
+    )
+    for split, d in zip(("train", "val", "test"), dm.get_data()):
+        for c in ("input_text_1", "input_text_2"):
+            bad = d[c].astype(str).str.contains(r"(?:Nature|Use|Category): nan\b", regex=True)
+            assert not bad.any(), (
+                f'{split} {c}: {int(bad.sum())} inputs carry "nan", e.g. {d[c][bad].iloc[0]!r}'
+            )
+    print("Sample input:", dm.get_data()[2]["input_text_1"].iloc[0])
+    return dm
+
+
+def _run_xgboost(ctx: dict) -> tuple:
+    from model.train import train_xgboost
+    from utils.compute_weight import compute_class_weight
+
+    dm = _data_manager(ctx, None, "ml")
+    X_train, y_train, X_val, y_val, X_test, y_test = dm.ml_data
+    model = train_xgboost(X_train, y_train, X_val, y_val, compute_class_weight(y_train))
+
+    def save() -> None:
+        model.get_booster().save_model(os.path.join(ctx["weights_dir"], "xgboost.json"))
+
+    best = getattr(model, "best_iteration", None)
+    extra = {"best_iteration": None if best is None else int(best)}
+    return model.predict(X_test), y_test, dm.get_data()[2], save, extra, None
+
+
+def _run_cross(ctx: dict) -> tuple:
+    import torch
+
+    from config.config_data import CONFIG_DATA
+    from config.config_model import CONFIG_MODEL
+    from model.models.CrossEncoder import get_model_cross_encoder
+    from model.train import train_cross_encoder
+    from utils.compute_weight import compute_class_weight
+    from utils.evaluate import get_preds_cross_encoder
+
+    dm = _data_manager(ctx, None, "cross_encoder")
+    train_dl, evaluator = dm.loaders
+    df_train, _, df_test = dm.get_data()
+    weights = torch.tensor(
+        compute_class_weight(df_train["label_score"].values),
+        dtype=torch.float32,
+        device=ctx["device"],
+    )
+    model = get_model_cross_encoder(
+        ctx["spec"]["model"],
+        num_classes=5,
+        max_len=CONFIG_DATA.MAX_LEN,
+        weights_tensor=weights,
+    )
+    epochs = 1 if ctx["smoke"] else CONFIG_MODEL.MODEL_CONFIG["cross_encoder"]["epochs"]
+    model = train_cross_encoder(
+        model, train_dl, evaluator, output_path=ctx["weights_dir"], epochs=epochs
+    )
+    preds, true = get_preds_cross_encoder(model, df_test)
+    extra = {
+        "epochs": epochs,
+        "class_weights": weights.tolist(),
+        "batch_size": 32,
+        "best_val_accuracy": float(getattr(model, "best_score", float("nan"))),
+    }
+    return preds, true, df_test, None, extra, None
+
+
+def _run_bi(ctx: dict) -> tuple:
+    from transformers import AutoTokenizer
+
+    from config.config_model import CONFIG_MODEL
+    from model.train import train_bi_encoder_baseline
+    from utils.compute_weight import compute_class_weight
+    from utils.evaluate import get_preds_siamese
+
+    model_name = ctx["spec"]["model"]
+    dm = _data_manager(ctx, AutoTokenizer.from_pretrained(model_name), "siamese")
+    train_loader, val_loader = dm.loaders
+    df_train, _, df_test = dm.get_data()
+    cw = compute_class_weight(df_train["label_score"].values)
+    epochs = 1 if ctx["smoke"] else CONFIG_MODEL.MODEL_CONFIG["siamese"]["num_epochs_cls"]
+    out = ctx["weights_dir"]
+    train_bi_encoder_baseline(
+        model_name, train_loader, val_loader, cw, out, ctx["device"], epochs=epochs
+    )
+    preds, true = get_preds_siamese(df_test, out, model_name, ctx["device"])
+    extra = {
+        "epochs": epochs,
+        "class_weights": list(map(float, cw)),
+        "batch_size": CONFIG_MODEL.MODEL_CONFIG["siamese"]["physical_batch_size"],
+    }
+    return preds, true, df_test, None, extra, None
+
+
+def _trainer_tokenizer_kw() -> str:
+    import inspect
+
+    from transformers import Trainer
+
+    return (
+        "processing_class"
+        if "processing_class" in inspect.signature(Trainer.__init__).parameters
+        else "tokenizer"
+    )
+
+
+def _run_multi(ctx: dict) -> tuple:
+    from transformers import DataCollatorWithPadding, Trainer, TrainingArguments
+
+    from config.config_model import CONFIG_MODEL
+    from model.get_tokenizer import get_tokenizer
+    from model.models.MultiTask import get_model_multi_task
+    from utils.compute_weight import compute_class_weight
+    from utils.evaluate import compute_metrics, get_preds_multi
+
+    spec = ctx["spec"]
+    tokenizer = get_tokenizer(spec["model"], add_class_tokens=True)
+    dm = _data_manager(ctx, tokenizer, "multi_task")
+    bad = [
+        t
+        for t in dm.class_to_token.values()
+        if len(tokenizer.encode(t, add_special_tokens=False)) != 1
+    ]
+    assert not bad, f"Class markers split into subwords: {bad[:5]}"
+    train_ds, val_ds, test_ds = dm.datasets
+    df_train, _, df_test = dm.get_data()
+    assert len(test_ds) == 2 * len(df_test), "create_patterns must give two rows per pair"
+    assert dm.NUM_PRODUCT_CLASSES == CONFIG_MODEL.NUM_PRODUCT_CLASSES
+
+    cfg = CONFIG_MODEL.multi_task_args(seed=SEED, output_dir=ctx["scratch"])
+    if ctx["smoke"]:
+        cfg["training_args"]["num_train_epochs"] = 1
+    args = TrainingArguments(**cfg["training_args"])
+    loss = dict(cfg["loss_args"], loss_type=spec.get("loss_type", "rank_aware"))
+    for k in ("aux_weight", "alpha"):
+        if k in spec:
+            loss[k] = spec[k]
+    class_weights = (
+        compute_class_weight(df_train["label_score"].values) if loss["loss_type"] == "ce" else None
+    )
+    model = get_model_multi_task(
+        spec["model"],
+        num_classes=ctx["n_classes"],
+        num_product_classes=dm.NUM_PRODUCT_CLASSES,
+        device=ctx["device"],
+        class_weights=class_weights,
+        tokenizer=tokenizer,
+        **loss,
+    )
+    assert model.get_input_embeddings().num_embeddings >= len(tokenizer)
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        data_collator=DataCollatorWithPadding(tokenizer),
+        compute_metrics=compute_metrics,
+        **{_trainer_tokenizer_kw(): tokenizer},
+    )
+    trainer.train()
+    preds, true, logits = get_preds_multi(trainer, test_ds, df_test)
+
+    def save() -> None:
+        trainer.save_model(ctx["weights_dir"])
+        tokenizer.save_pretrained(ctx["weights_dir"])
+
+    extra = {
+        "loss_args": loss,
+        "class_weights": None if class_weights is None else list(map(float, class_weights)),
+        "epochs": args.num_train_epochs,
+        "learning_rate": args.learning_rate,
+        "per_device_batch": args.per_device_train_batch_size,
+        "grad_accum": args.gradient_accumulation_steps,
+        "effective_batch": args.per_device_train_batch_size
+        * args.gradient_accumulation_steps
+        * max(1, args.n_gpu),
+        "fp16": args.fp16,
+        "best_checkpoint": trainer.state.best_model_checkpoint,
+        "best_val_f1_macro": trainer.state.best_metric,
+        "vocab_size": len(tokenizer),
+    }
+    return preds, true, df_test, save, extra, logits
+
+
+def _run_probe(ctx: dict) -> tuple:
     import numpy as np
     import pandas as pd
     import torch
+    from transformers import AutoTokenizer, DataCollatorWithPadding, Trainer, TrainingArguments
 
-    from config import CONFIG_DATA, CONFIG_MODEL
-    from preprocess import DataManager
-    from utils import seed_worker, compute_class_weight, get_stats, build_result_df
+    from config.config_data import CONFIG_DATA
+    from model.models.MultiTask import JointClassSimBGE
+    from preprocess.data_loader import create_patterns, to_dataset
+    from preprocess.preprocess_data import preprocess
+    from utils.evaluate import build_result_df, get_preds_multi
+    from utils.metrics import stats
+
+    spec, results_dir, tag = ctx["spec"], ctx["results_dir"], ctx["tag"]
+    ckpt = find_checkpoint(spec["source"])
+    print("Checkpoint:", ckpt)
+    tokenizer = AutoTokenizer.from_pretrained(ckpt, use_fast=False)
+    model = JointClassSimBGE.from_pretrained(ckpt).to(ctx["device"]).eval()
+    nice = sorted(CONFIG_DATA.NICE_CLASS_MAP)
+    class_to_token = {c: f"[CLASS_{c}]" for c in nice}
+    class_to_id = {c: i for i, c in enumerate(nice)}
+    bad = [
+        t
+        for t in class_to_token.values()
+        if len(tokenizer.encode(t, add_special_tokens=False)) != 1
+    ]
+    assert not bad, f"Checkpoint tokenizer lacks the class tokens: {bad[:5]}"
+
+    raw = pd.read_csv(os.path.join(ctx["data_root"], spec["variant"], "test.csv"), low_memory=False)
+    base = preprocess(raw.copy())
+
+    def build(term: str, nature: str, purpose: str, cls: int, use_c: bool = True) -> str:
+        parts = []
+        if str(nature).strip():
+            parts.append(f"Nature: {str(nature).strip()}")
+        if str(purpose).strip():
+            parts.append(f"Use: {str(purpose).strip()}")
+        if use_c and CONFIG_DATA.NICE_CLASS_MAP.get(int(cls), ""):
+            parts.append(f"Category: {CONFIG_DATA.NICE_CLASS_MAP[int(cls)]}")
+        text = str(term).strip()
+        return f"{text} [ {' | '.join(parts)} ]" if parts else text
+
+    def frame(n1: list, p1: list, n2: list, p2: list, use_c: bool = True) -> pd.DataFrame:
+        d = base.copy()
+        d["input_text_1"] = [build(*x, use_c=use_c) for x in zip(d["Term 1"], n1, p1, d["Class 1"])]
+        d["input_text_2"] = [build(*x, use_c=use_c) for x in zip(d["Term 2"], n2, p2, d["Class 2"])]
+        return d
+
+    N1, P1, N2, P2 = (
+        raw[c].fillna("").astype(str).values
+        for c in ("Nature 1", "Purpose 1", "Nature 2", "Purpose 2")
+    )
+    full = frame(N1, P1, N2, P2)
+    assert (full["input_text_1"] == base["input_text_1"]).all(), (
+        "Probe input builder drifted from preprocess()"
+    )
+    assert (full["input_text_2"] == base["input_text_2"]).all(), (
+        "Probe input builder drifted from preprocess()"
+    )
+    rng = np.random.default_rng(SEED)
+    pool = np.array(list(zip(np.r_[N1, N2], np.r_[P1, P2])), dtype=object)
+    perm = pool[rng.permutation(len(pool))]
+    n = len(raw)
+    empty = [""] * n
+    conditions = {
+        "full": full,
+        "no_nature": frame(empty, P1, empty, P2),
+        "no_purpose": frame(N1, empty, N2, empty),
+        "heading_only": frame(empty, empty, empty, empty),
+        "no_heading": frame(N1, P1, N2, P2, use_c=False),
+        "bare_term": frame(empty, empty, empty, empty, use_c=False),
+        "shuffled_attributes": frame(perm[:n, 0], perm[:n, 1], perm[n:, 0], perm[n:, 1]),
+    }
+
+    args = TrainingArguments(
+        output_dir=ctx["scratch"],
+        per_device_eval_batch_size=16,
+        report_to="none",
+        fp16=torch.cuda.is_available(),
+        remove_unused_columns=False,
+        dataloader_num_workers=2,
+    )
+    trainer = Trainer(
+        model=model,
+        args=args,
+        data_collator=DataCollatorWithPadding(tokenizer),
+        **{_trainer_tokenizer_kw(): tokenizer},
+    )
+    results = {}
+    for name, d in conditions.items():
+        ds = to_dataset(create_patterns(d, tokenizer, class_to_token, class_to_id), tokenizer)
+        p, t, lg = get_preds_multi(trainer, ds, d)
+        build_result_df(d, t, p).to_csv(
+            os.path.join(results_dir, f"{tag}_{name}_preds.csv"), index=False
+        )
+        np.save(os.path.join(results_dir, f"{tag}_{name}_logits.npy"), lg)
+        m = stats(t, p)
+        results[name] = {
+            "f1_macro": m["f1_macro"],
+            "qwk": m["qwk"],
+            "mae": m["mae"],
+            "adjacent_acc": m["adjacent_acc"],
+            "severe_rate": m["severe_rate"],
+            "per_class_f1": [r["f1"] for r in m["per_class"]],
+            "example_input": d["input_text_1"].iloc[0],
+        }
+        print(
+            f"[probe] {name:20s} Macro-F1 {m['f1_macro'] * 100:.2f} | QWK {m['qwk']:.4f} | MAE {m['mae']:.4f}"
+        )
+        if name == "full":
+            preds, true = p, t
+    for r in results.values():
+        r["delta_f1_vs_full"] = r["f1_macro"] - results["full"]["f1_macro"]
+    return preds, true, full, None, {"checkpoint": ckpt, "conditions": results}, None
+
+
+def _run_hybrid(ctx: dict) -> tuple:
+    import numpy as np
+    import pandas as pd
+    import torch
+    import torch.nn as nn
+    from sentence_transformers import SentenceTransformer
+    from sklearn.metrics import f1_score
+
+    from utils.compute_weight import compute_class_weight
+
+    device = ctx["device"]
+    dm = _data_manager(ctx, None, "ml")
+    df_train, df_val, df_test = dm.get_data()
+    encoder_name = ctx["spec"]["model"]
+    encoder = SentenceTransformer(encoder_name, device=str(device), trust_remote_code=True)
+    texts = sorted(
+        set(
+            pd.concat(
+                [
+                    d[c]
+                    for d in (df_train, df_val, df_test)
+                    for c in ("input_text_1", "input_text_2")
+                ]
+            ).astype(str)
+        )
+    )
+    emb = encoder.encode(
+        texts,
+        batch_size=64,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=True,
+    )
+    index = {t: i for i, t in enumerate(texts)}
+    del encoder
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    def feats(d: pd.DataFrame) -> np.ndarray:
+        u = emb[[index[str(t)] for t in d["input_text_1"]]]
+        v = emb[[index[str(t)] for t in d["input_text_2"]]]
+        c1 = np.eye(45, dtype=np.float32)[d["Class 1"].values - 1]
+        c2 = np.eye(45, dtype=np.float32)[d["Class 2"].values - 1]
+        same = (d["Class 1"].values == d["Class 2"].values).astype(np.float32)[:, None]
+        return np.hstack([u, v, np.abs(u - v), u * v, c1, c2, same]).astype(np.float32)
+
+    Xtr, Xva, Xte = (torch.tensor(feats(d)) for d in (df_train, df_val, df_test))
+    ytr = torch.tensor(df_train["label_score"].values)
+    cw = compute_class_weight(df_train["label_score"].values)
+    net = nn.Sequential(
+        nn.Linear(Xtr.shape[1], 1024),
+        nn.ReLU(),
+        nn.Dropout(0.1),
+        nn.Linear(1024, 512),
+        nn.ReLU(),
+        nn.Dropout(0.1),
+        nn.Linear(512, 256),
+        nn.ReLU(),
+        nn.Dropout(0.1),
+        nn.Linear(256, 5),
+    ).to(device)
+    opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
+    crit = nn.CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float32, device=device))
+    max_epochs, patience = (2, 2) if ctx["smoke"] else (50, 8)
+    best, best_state, best_epoch, wait = -1.0, None, 0, 0
+
+    def predict(X: torch.Tensor) -> np.ndarray:
+        net.eval()
+        with torch.no_grad():
+            chunks = [
+                net(X[i : i + 1024].to(device)).argmax(1).cpu() for i in range(0, len(X), 1024)
+            ]
+        return torch.cat(chunks).numpy()
+
+    for epoch in range(1, max_epochs + 1):
+        net.train()
+        order = torch.randperm(len(Xtr), generator=ctx["generator"])
+        for i in range(0, len(order), 256):
+            b = order[i : i + 256]
+            opt.zero_grad()
+            loss = crit(net(Xtr[b].to(device)), ytr[b].to(device))
+            loss.backward()
+            opt.step()
+        val_f1 = f1_score(df_val["label_score"].values, predict(Xva), average="macro")
+        print(f"Epoch {epoch} | loss {loss.item():.4f} | val macro-F1 {val_f1:.4f}")
+        if val_f1 > best:
+            best, best_epoch, wait = val_f1, epoch, 0
+            best_state = {k: t.detach().cpu().clone() for k, t in net.state_dict().items()}
+        else:
+            wait += 1
+            if wait >= patience:
+                break
+    net.load_state_dict(best_state)
+
+    def save() -> None:
+        torch.save(
+            {
+                "state_dict": best_state,
+                "encoder": encoder_name,
+                "in_dim": int(Xtr.shape[1]),
+                "features": "[u, v, |u-v|, u*v, onehot(class1), onehot(class2), same_class]",
+            },
+            os.path.join(ctx["weights_dir"], "hybrid_mlp.pt"),
+        )
+
+    extra = {
+        "encoder": encoder_name,
+        "feature_dim": int(Xtr.shape[1]),
+        "best_epoch": best_epoch,
+        "epochs_run": epoch,
+        "best_val_f1_macro": float(best),
+        "class_weights": list(map(float, cw)),
+        "unique_texts": len(texts),
+    }
+    return predict(Xte), df_test["label_score"].values, df_test, save, extra, None
+
+
+FAMILIES = {
+    "xgboost": _run_xgboost,
+    "cross": _run_cross,
+    "bi": _run_bi,
+    "multi": _run_multi,
+    "probe": _run_probe,
+    "hybrid": _run_hybrid,
+}
+
+
+def run_experiment(
+    run_id: int, data_root: str | None = None, out_root: str = ".", smoke: bool = False
+) -> dict:
+    import numpy as np
+    import torch
+
+    from utils.evaluate import build_result_df
+    from utils.metrics import binary_metrics, plot_confusion, stats
 
     spec = get_run(run_id)
-    tag = f"{run_id:02d}_{spec['name']}_seed{seed}"
-    if smoke:
-        tag = "SMOKE_" + tag
+    tag = run_tag(run_id, smoke)
+    n_classes = 2 if spec.get("binary") else 5
+    if n_classes == 2 and spec["family"] != "multi":
+        raise ValueError("binary=True is implemented for the multi family only")
     data_root = find_variant_root(find_data_root(data_root), spec["variant"])
     results_dir = os.path.join(out_root, "results")
     weights_dir = os.path.join(out_root, "weights", tag)
     scratch = os.path.join("/tmp" if os.path.isdir("/tmp") else out_root, "codraft_ckpt", tag)
-    os.makedirs(results_dir, exist_ok=True)
-    os.makedirs(scratch, exist_ok=True)
-    if save_weights:
-        os.makedirs(weights_dir, exist_ok=True)
+    for d in (results_dir, weights_dir, scratch):
+        os.makedirs(d, exist_ok=True)
 
     print("=" * 78)
-    print(f"run {run_id}: {spec['name']}  [{spec['table']}] {spec['row']}")
-    print(f"family={spec['family']} model={spec['model']} variant={spec['variant']} seed={seed}"
-          + ("  SMOKE TEST" if smoke else ""))
+    print(f"Run {run_id}: {spec['name']}  [{spec['table']}] {spec['row']}")
+    smoke_note = "  SMOKE TEST" if smoke else ""
+    print(
+        f"family={spec['family']} model={spec['model']} variant={spec['variant']} seed={SEED}{smoke_note}"
+    )
     print("=" * 78)
-
     if smoke:
         data_root = _smoke_data(data_root, spec["variant"], os.path.join(scratch, "data"))
-    print("data:", data_root)
+    print("Data:", data_root)
 
-    generator = _setup_determinism(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ctx = {
+        "spec": spec,
+        "tag": tag,
+        "smoke": smoke,
+        "data_root": data_root,
+        "results_dir": results_dir,
+        "weights_dir": weights_dir,
+        "scratch": scratch,
+        "n_classes": n_classes,
+        "generator": _setup_determinism(SEED),
+        "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    }
     env = _environment()
-    print("env:", json.dumps(env))
+    print("Environment:", json.dumps(env))
     t0 = time.time()
+    preds, true, df_test, save, extra, logits = FAMILIES[spec["family"]](ctx)
 
-    def data_manager(tokenizer, build_for):
-        dm = DataManager(input_root=data_root, work_dir=scratch, config_data=CONFIG_DATA,
-                         tokenizer=tokenizer, seed_worker=seed_worker,
-                         data_generator=generator, random_seed=seed, rebalance=False,
-                         variant=spec["variant"], build_for=build_for,
-                         binary=spec.get("binary", False))
-        # An empty cell that became the text "nan" trained run 13 on "Nature: nan | Use: nan";
-        # stop before training if any input still carries one.
-        for split, d in zip(("train", "val", "test"), dm.get_data()):
-            for c in ("input_text_1", "input_text_2"):
-                bad = d[c].astype(str).str.contains(r"(?:Nature|Use|Category): nan\b", regex=True)
-                assert not bad.any(), f"{split} {c}: {int(bad.sum())} inputs carry 'nan', e.g. {d[c][bad].iloc[0]!r}"
-        print("sample input:", dm.get_data()[2]["input_text_1"].iloc[0])
-        return dm
-
-    extra = {}
-    logits = None
-    family = spec["family"]
-    # 5 ordinal levels; 2 for a run with binary=True (Similar vs Dissimilar, as Le Nir et al.)
-    n_classes = 2 if spec.get("binary") else 5
-    if n_classes == 2 and family != "multi":
-        raise ValueError("binary=True is implemented for the multi family only")
-
-    if family == "xgboost":
-        from model import train_xgboost
-        from utils import get_preds_ml
-        dm = data_manager(None, "ml")
-        X_train, y_train, X_val, y_val, X_test, y_test = dm.get_ml_data()
-        _, _, df_test = dm.get_data()
-        model, _ = train_xgboost(X_train, y_train, X_val, y_val, compute_class_weight(y_train))
-        preds, true = get_preds_ml(model, X_test, y_test)
-        # Through the booster: XGBClassifier.save_model reads _estimator_type, which
-        # scikit-learn >= 1.6 no longer defines, and fails with older xgboost.
-        save_fn = lambda: model.get_booster().save_model(os.path.join(weights_dir, "xgboost.json"))
-        bi = getattr(model, "best_iteration", None)
-        extra["best_iteration"] = None if bi is None else int(bi)
-
-    elif family == "cross":
-        from model import train_cross_encoder
-        from model.models import get_model
-        from utils import get_preds_cross_encoder
-        dm = data_manager(None, "cross_encoder")
-        train_dl, evaluator = dm.get_dataloaders(model_type="cross_encoder")
-        df_train, _, df_test = dm.get_data()
-        weights = torch.tensor(compute_class_weight(df_train["label_score"].values),
-                               dtype=torch.float32, device=device)
-        model, _ = get_model(model_type="cross_encoder", model_name=spec["model"],
-                             num_classes=5, max_len=CONFIG_MODEL.MAX_LEN, weights_tensor=weights)
-        epochs = 1 if smoke else CONFIG_MODEL.MODEL_CONFIG["cross_encoder"]["epochs"]
-        model = train_cross_encoder(model, train_dl, evaluator,
-                                    output_path=weights_dir if save_weights else scratch,
-                                    epochs=epochs)
-        preds, true = get_preds_cross_encoder(model=model, df_test=df_test)
-        save_fn = None   # fit() already saved the best checkpoint into weights_dir
-        extra.update(epochs=epochs, class_weights=weights.tolist(), batch_size=32,
-                     best_val_accuracy=float(getattr(model, "best_score", float("nan"))))
-
-    elif family == "bi":
-        from transformers import AutoTokenizer
-        from model import train_bi_encoder_baseline
-        from utils import get_preds_siamese
-        # The same (fast) tokenizer SentenceTransformer loads for prediction.
-        tok = AutoTokenizer.from_pretrained(spec["model"])
-        dm = data_manager(tok, "siamese")
-        train_loader, val_loader = dm.get_dataloaders(model_type="siamese")
-        df_train, _, df_test = dm.get_data()
-        cw = compute_class_weight(df_train["label_score"].values)
-        epochs = 1 if smoke else CONFIG_MODEL.MODEL_CONFIG["siamese"]["num_epochs_cls"]
-        out = weights_dir if save_weights else scratch
-        train_bi_encoder_baseline(spec["model"], train_loader, val_loader, cw, out, device,
-                                  epochs=epochs)
-        preds, true = get_preds_siamese(df_test, out, spec["model"], device)
-        save_fn = None   # training saved the best epoch into weights_dir
-        extra.update(epochs=epochs, class_weights=list(map(float, cw)),
-                     batch_size=CONFIG_MODEL.MODEL_CONFIG["siamese"]["physical_batch_size"])
-
-    elif family == "multi":
-        import inspect
-        from transformers import Trainer, DataCollatorWithPadding
-        from model import get_tokenizer
-        from model.models import get_model, get_training_args
-        from utils import compute_metrics, get_preds_multi
-
-        tokenizer = get_tokenizer(spec["model"], add_class_tokens=True)
-        dm = data_manager(tokenizer, "multi_task")
-        bad = [t for t in dm.class_to_token.values()
-               if len(tokenizer.encode(t, add_special_tokens=False)) != 1]
-        assert not bad, f"class markers split into subwords: {bad[:5]}"
-        train_ds, val_ds, test_ds = dm.get_dataset()
-        df_train, _, df_test = dm.get_data()
-        assert len(test_ds) == 2 * len(df_test), "create_patterns must give two rows per pair"
-        assert dm.NUM_PRODUCT_CLASSES == CONFIG_MODEL.NUM_PRODUCT_CLASSES
-
-        cfg = CONFIG_MODEL.multi_task_args(seed=seed, output_dir=scratch, n_gpu=1)
-        if smoke:
-            cfg["training_args"]["num_train_epochs"] = 1
-        training_args = get_training_args(**cfg["training_args"])
-
-        loss = dict(cfg["loss_args"])
-        loss["loss_type"] = spec.get("loss_type", "rank_aware")
-        for k in ("aux_weight", "alpha"):
-            if k in spec:
-                loss[k] = spec[k]
-        class_weights = (compute_class_weight(df_train["label_score"].values)
-                         if loss["loss_type"] == "ce" else None)
-
-        model, _ = get_model(model_type="multi_task", model_name=spec["model"],
-                             num_classes=n_classes, num_product_classes=dm.NUM_PRODUCT_CLASSES,
-                             device=device, class_weights=class_weights, tokenizer=tokenizer,
-                             **loss)
-        assert model.get_input_embeddings().num_embeddings >= len(tokenizer)
-
-        # transformers renamed Trainer(tokenizer=) to processing_class= in 4.46; the pinned
-        # 4.45.2 only knows the old name.
-        tok_kw = ("processing_class" if "processing_class" in
-                  inspect.signature(Trainer.__init__).parameters else "tokenizer")
-        trainer = Trainer(model=model, args=training_args, train_dataset=train_ds,
-                          eval_dataset=val_ds, data_collator=DataCollatorWithPadding(tokenizer),
-                          compute_metrics=compute_metrics, **{tok_kw: tokenizer})
-        trainer.train()
-        preds, true, logits = get_preds_multi(trainer, test_ds, df_test, return_logits=True)
-        np.save(os.path.join(results_dir, f"{tag}_logits.npy"), logits)
-        def save_fn():
-            trainer.save_model(weights_dir)
-            tokenizer.save_pretrained(weights_dir)
-        a = training_args
-        extra.update(loss_args=loss, class_weights=None if class_weights is None
-                     else list(map(float, class_weights)),
-                     epochs=a.num_train_epochs, learning_rate=a.learning_rate,
-                     per_device_batch=a.per_device_train_batch_size,
-                     grad_accum=a.gradient_accumulation_steps,
-                     effective_batch=a.per_device_train_batch_size * a.gradient_accumulation_steps
-                     * max(1, a.n_gpu), fp16=a.fp16,
-                     best_checkpoint=trainer.state.best_model_checkpoint,
-                     best_val_f1_macro=trainer.state.best_metric,
-                     vocab_size=len(tokenizer))
-    elif family == "probe":
-        import inspect
-        from datasets import Dataset
-        from transformers import AutoTokenizer, DataCollatorWithPadding, Trainer, TrainingArguments
-        from model.models.MultiTask import JointClassSimBGE
-        from preprocess.preprocess_data import preprocess
-        from preprocess.data_loader import create_patterns, preprocess_dataset
-        from utils import get_preds_multi
-
-        ckpt = find_checkpoint(spec["source"])
-        print("checkpoint:", ckpt)
-        tokenizer = AutoTokenizer.from_pretrained(ckpt, use_fast=False)
-        model = JointClassSimBGE.from_pretrained(ckpt).to(device).eval()
-        nice = sorted(CONFIG_DATA.NICE_CLASS_MAP)
-        class_to_token = {c: f"[CLASS_{c}]" for c in nice}
-        class_to_id = {c: i for i, c in enumerate(nice)}
-        bad = [t for t in class_to_token.values() if len(tokenizer.encode(t, add_special_tokens=False)) != 1]
-        assert not bad, f"checkpoint tokenizer lacks the class tokens: {bad[:5]}"
-
-        raw = pd.read_csv(os.path.join(data_root, spec["variant"], "test.csv"), low_memory=False)
-        base = preprocess(raw.copy())
-
-        def build(term, nature, purpose, cls, use_n=True, use_p=True, use_c=True):
-            # Same format as preprocess_data.create_structured_text_enhanced, with switches.
-            parts = []
-            if use_n and str(nature).strip():
-                parts.append(f"Nature: {str(nature).strip()}")
-            if use_p and str(purpose).strip():
-                parts.append(f"Use: {str(purpose).strip()}")
-            if use_c and CONFIG_DATA.NICE_CLASS_MAP.get(int(cls), ""):
-                parts.append(f"Category: {CONFIG_DATA.NICE_CLASS_MAP[int(cls)]}")
-            t = str(term).strip()
-            return f"{t} [ {' | '.join(parts)} ]" if parts else t
-
-        def frame(n1, p1, n2, p2, **kw):
-            d = base.copy()
-            d["input_text_1"] = [build(t, n, p, c, **kw) for t, n, p, c in zip(d["Term 1"], n1, p1, d["Class 1"])]
-            d["input_text_2"] = [build(t, n, p, c, **kw) for t, n, p, c in zip(d["Term 2"], n2, p2, d["Class 2"])]
-            return d
-
-        N1, P1, N2, P2 = (raw[c].fillna("").astype(str).values for c in ("Nature 1", "Purpose 1", "Nature 2", "Purpose 2"))
-        full = frame(N1, P1, N2, P2)
-        assert (full["input_text_1"] == base["input_text_1"]).all() and \
-            (full["input_text_2"] == base["input_text_2"]).all(), "probe input builder drifted from preprocess()"
-        # shuffled: every side gets the (Nature, Purpose) of a random other side
-        rng = np.random.default_rng(seed)
-        pool = np.array(list(zip(np.r_[N1, N2], np.r_[P1, P2])), dtype=object)
-        perm = pool[rng.permutation(len(pool))]
-        n = len(raw)
-        conds = {
-            "full": full,
-            "no_nature": frame([""] * n, P1, [""] * n, P2),
-            "no_purpose": frame(N1, [""] * n, N2, [""] * n),
-            "heading_only": frame([""] * n, [""] * n, [""] * n, [""] * n),
-            "no_heading": frame(N1, P1, N2, P2, use_c=False),
-            "bare_term": frame([""] * n, [""] * n, [""] * n, [""] * n, use_c=False),
-            "shuffled_attributes": frame(perm[:n, 0], perm[:n, 1], perm[n:, 0], perm[n:, 1]),
-        }
-
-        tok_kw = ("processing_class" if "processing_class" in
-                  inspect.signature(Trainer.__init__).parameters else "tokenizer")
-        args = TrainingArguments(output_dir=scratch, per_device_eval_batch_size=16, report_to="none",
-                                 fp16=torch.cuda.is_available(), remove_unused_columns=False,
-                                 dataloader_num_workers=2)
-        trainer = Trainer(model=model, args=args, data_collator=DataCollatorWithPadding(tokenizer),
-                          **{tok_kw: tokenizer})
-        cols = ["input_ids", "attention_mask", "labels", "aux_labels"]
-        results = {}
-        for name, d in conds.items():
-            aug = create_patterns(d, tokenizer, class_to_token, class_to_id)
-            ds = Dataset.from_pandas(aug).map(preprocess_dataset, batched=True,
-                                              fn_kwargs={"tokenizer": tokenizer},
-                                              remove_columns=aug.columns.tolist())
-            ds.set_format(type="torch", columns=cols)
-            p, t, lg = get_preds_multi(trainer, ds, d, return_logits=True)
-            build_result_df(d, t, p).to_csv(os.path.join(results_dir, f"{tag}_{name}_preds.csv"), index=False)
-            np.save(os.path.join(results_dir, f"{tag}_{name}_logits.npy"), lg)
-            mc = get_stats(build_result_df(d, t, p), fig_prefix=os.path.join(results_dir, f"cm_{tag}_{name}"),
-                           return_metrics=True)
-            results[name] = {"f1_macro": mc["f1_macro"], "qwk": float(mc["qwk"]), "mae": float(mc["mae"]),
-                             "adjacent_acc": mc["adjacent_acc"], "severe_rate": mc["severe_rate"],
-                             "per_class_f1": [r["f1"] for r in mc["per_class"]],
-                             "example_input": d["input_text_1"].iloc[0]}
-            print(f"[probe] {name:20s} Macro-F1 {mc['f1_macro']*100:.2f} | QWK {mc['qwk']:.4f} | MAE {mc['mae']:.4f}")
-            if name == "full":
-                preds, true, df_test = p, t, d
-        for name in results:
-            results[name]["delta_f1_vs_full"] = results[name]["f1_macro"] - results["full"]["f1_macro"]
-        save_fn = None   # inference only; no new weights
-        extra.update(checkpoint=ckpt, conditions=results)
-
-    elif family == "hybrid":
-        import torch.nn as nn
-        from sentence_transformers import SentenceTransformer
-        from sklearn.metrics import f1_score as _f1
-
-        dm = data_manager(None, "ml")
-        df_train, df_val, df_test = dm.get_data()
-        # CODRAFT_HYBRID_ENCODER swaps in a small encoder for local testing only.
-        enc_name = os.environ.get("CODRAFT_HYBRID_ENCODER", spec["model"])
-        enc = SentenceTransformer(enc_name, device=str(device), trust_remote_code=True)
-        texts = sorted(set(pd.concat([d[c] for d in (df_train, df_val, df_test)
-                                      for c in ("input_text_1", "input_text_2")]).astype(str)))
-        emb = enc.encode(texts, batch_size=64, convert_to_numpy=True, normalize_embeddings=True,
-                         show_progress_bar=True)
-        row = {t: i for i, t in enumerate(texts)}
-        del enc
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-        def feats(d):
-            u = emb[[row[str(t)] for t in d["input_text_1"]]]
-            v = emb[[row[str(t)] for t in d["input_text_2"]]]
-            c1 = np.eye(45, dtype=np.float32)[d["Class 1"].values - 1]
-            c2 = np.eye(45, dtype=np.float32)[d["Class 2"].values - 1]
-            same = (d["Class 1"].values == d["Class 2"].values).astype(np.float32)[:, None]
-            return np.hstack([u, v, np.abs(u - v), u * v, c1, c2, same]).astype(np.float32)
-
-        Xtr, Xva, Xte = (torch.tensor(feats(d)) for d in (df_train, df_val, df_test))
-        ytr = torch.tensor(df_train["label_score"].values)
-        cw = compute_class_weight(df_train["label_score"].values)
-        net = nn.Sequential(nn.Linear(Xtr.shape[1], 1024), nn.ReLU(), nn.Dropout(0.1),
-                            nn.Linear(1024, 512), nn.ReLU(), nn.Dropout(0.1),
-                            nn.Linear(512, 256), nn.ReLU(), nn.Dropout(0.1),
-                            nn.Linear(256, 5)).to(device)
-        opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
-        crit = nn.CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float32, device=device))
-        max_epochs, patience = (2, 2) if smoke else (50, 8)
-        best, best_state, best_epoch, wait = -1.0, None, 0, 0
-
-        def predict(X):
-            net.eval()
-            with torch.no_grad():
-                return torch.cat([net(X[i:i + 1024].to(device)).argmax(1).cpu()
-                                  for i in range(0, len(X), 1024)]).numpy()
-        for epoch in range(1, max_epochs + 1):
-            net.train()
-            order = torch.randperm(len(Xtr), generator=generator)
-            for i in range(0, len(order), 256):
-                b = order[i:i + 256]
-                opt.zero_grad()
-                loss = crit(net(Xtr[b].to(device)), ytr[b].to(device))
-                loss.backward()
-                opt.step()
-            vf = _f1(df_val["label_score"].values, predict(Xva), average="macro")
-            print(f"epoch {epoch} | loss {loss.item():.4f} | val macro-F1 {vf:.4f}")
-            if vf > best:
-                best, best_epoch, wait = vf, epoch, 0
-                best_state = {k: t.detach().cpu().clone() for k, t in net.state_dict().items()}
-            else:
-                wait += 1
-                if wait >= patience:
-                    break
-        net.load_state_dict(best_state)
-        preds, true = predict(Xte), df_test["label_score"].values
-        def save_fn():
-            torch.save({"state_dict": best_state, "encoder": enc_name, "in_dim": int(Xtr.shape[1]),
-                        "features": "[u, v, |u-v|, u*v, onehot(class1), onehot(class2), same_class]"},
-                       os.path.join(weights_dir, "hybrid_mlp.pt"))
-        extra.update(encoder=enc_name, feature_dim=int(Xtr.shape[1]), best_epoch=best_epoch,
-                     epochs_run=epoch, best_val_f1_macro=float(best), class_weights=list(map(float, cw)),
-                     unique_texts=len(texts))
-    else:
-        raise ValueError(f"unknown family {family!r}")
-
-    # ------------------------------------------------------------- evaluation
     true = np.asarray(true).astype(int)
     preds = np.asarray(preds).astype(int)
+    if logits is not None:
+        np.save(os.path.join(results_dir, f"{tag}_logits.npy"), logits)
     result_df = build_result_df(df_test, true, preds)
     if "label_5" in df_test.columns:
-        result_df["label_5"] = df_test["label_5"].values      # binary run: the level it collapsed
+        result_df["label_5"] = df_test["label_5"].values
     result_df.to_csv(os.path.join(results_dir, f"{tag}_preds.csv"), index=False)
-    m = get_stats(result_df, fig_prefix=os.path.join(results_dir, f"cm_{tag}"),
-                  return_metrics=True, num_classes=n_classes)
-    names = BINARY_NAMES if n_classes == 2 else LABEL_NAMES
-
+    m = stats(true, preds, n_classes)
+    plot_confusion(m["confusion_matrix"], os.path.join(results_dir, f"cm_{tag}"))
     record = {
-        "run_id": run_id, "tag": tag, "smoke": smoke, "seed": seed, **spec,
+        "run_id": run_id,
+        "tag": tag,
+        "smoke": smoke,
+        "seed": SEED,
+        **spec,
         "n_test": int(len(df_test)),
-        "f1_macro": m["f1_macro"], "qwk": float(m["qwk"]), "mae": float(m["mae"]),
-        "accuracy": m["accuracy"], "precision_macro": m["precision_macro"],
-        "recall_macro": m["recall_macro"], "adjacent_acc": m["adjacent_acc"],
+        **{
+            k: m[k]
+            for k in ("f1_macro", "qwk", "mae", "accuracy", "precision_macro", "recall_macro")
+        },
+        "adjacent_acc": m["adjacent_acc"],
         "severe_rate": m["severe_rate"],
-        "per_class": [{**r, "name": names[r["class"]]} for r in m["per_class"]],
+        "per_class": m["per_class"],
         "n_classes": n_classes,
         "binary": binary_metrics(true, preds),
-        "confusion_matrix": m["confusion_matrix"].tolist(),
+        "confusion_matrix": m["confusion_matrix"],
         "train_seconds": round(time.time() - t0, 1),
-        "environment": env, "settings": extra,
+        "environment": env,
+        "settings": extra,
     }
     with open(os.path.join(results_dir, f"{tag}_metrics.json"), "w") as fh:
         json.dump(record, fh, indent=2, default=float)
 
-    # Weights last, once the results are safely written: a failure here must not cost
-    # the numbers of a run that has already finished.
-    if save_weights and save_fn is not None:
+    if save is not None:
         try:
-            save_fn()
-            print("weights:", weights_dir)
+            save()
+            print("Weights:", weights_dir)
         except Exception as e:
-            print(f"!! could not save weights ({type(e).__name__}: {e}); results are kept")
+            print(f"Could not save the weights ({type(e).__name__}: {e}); the results are kept.")
 
-    print("\n" + "=" * 78)
-    print(f"DONE run {run_id} {spec['name']}: Macro-F1 {m['f1_macro']*100:.2f} | "
-          f"QWK {m['qwk']:.4f} | MAE {m['mae']:.4f} | n={len(df_test)} | "
-          f"{record['train_seconds']/60:.1f} min")
-    print("per-class F1: " + " / ".join(f"{r['f1']*100:.2f}" for r in m["per_class"]))
     b = record["binary"]
-    print(f"binary (Le Nir): F1 {b['natural']['f1']:.4f} on the test set"
-          + (f", {b['balanced']['f1']:.4f} on {b['n_balanced']} balanced test sets" if "balanced" in b else ""))
+    print("\n" + "=" * 78)
+    print(
+        f"DONE run {run_id} {spec['name']}: Macro-F1 {m['f1_macro'] * 100:.2f} | QWK {m['qwk']:.4f} | "
+        f"MAE {m['mae']:.4f} | n={len(df_test)} | {record['train_seconds'] / 60:.1f} min"
+    )
+    print("Per-class F1: " + " / ".join(f"{r['f1'] * 100:.2f}" for r in m["per_class"]))
+    balanced = (
+        f", {b['balanced']['f1']:.4f} on {b['n_balanced']} balanced test sets"
+        if "balanced" in b
+        else ""
+    )
+    print(f"Binary (Le Nir): F1 {b['natural']['f1']:.4f} on the test set{balanced}")
     print("=" * 78)
     return record
 
 
-# ------------------------------------------------------------------- launching
-
-def _gpu_count():
+def _gpu_count() -> int:
     try:
         out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=30)
-        return len([l for l in out.stdout.splitlines() if l.startswith("GPU ")])
+        return len([line for line in out.stdout.splitlines() if line.startswith("GPU ")])
     except Exception:
         return 0
 
 
-_PRINT_LOCK = threading.Lock()
-
-
-def _say(text):
-    # Two runs stream at once; without the lock their lines interleave mid-line.
-    with _PRINT_LOCK:
+def _say(text: str) -> None:
+    with PRINT_LOCK:
         print(text, flush=True)
 
 
-def _stream(proc, prefix, log_path, progress_every=60):
-    """Echo a child's output with a prefix. Progress-bar redraws (\\r) are throttled so the
-    notebook output stays readable; the log file keeps everything."""
-    last = 0.0
-    buf = ""
+def _stream(proc: subprocess.Popen, prefix: str, log_path: str, progress_every: int = 60) -> None:
+    last, buf = 0.0, ""
     with open(log_path, "w", buffering=1) as log:
         while True:
             ch = proc.stdout.read(1)
             if not ch:
                 break
             log.write(ch)
-            if ch in "\r\n":
-                line, buf = buf.strip(), ""
-                if not line:
-                    continue
-                if ch == "\n" or time.time() - last > progress_every:
-                    _say(f"{prefix} {line}")
-                    if ch == "\r":
-                        last = time.time()
-            else:
+            if ch not in "\r\n":
                 buf += ch
+                continue
+            line, buf = buf.strip(), ""
+            if line and (ch == "\n" or time.time() - last > progress_every):
+                _say(f"{prefix} {line}")
+                if ch == "\r":
+                    last = time.time()
         if buf.strip():
             _say(f"{prefix} {buf.strip()}")
 
 
-def launch(run_ids, data_root=None, out_root=".", seed=DEFAULT_SEED, smoke=False,
-           save_weights=True):
-    """Run one ID, or several side by side with one GPU each.
-
-    With more runs than GPUs the extra ones wait for a free card. Raises at the end if any
-    run failed, so a Kaggle "Save & Run All" shows the failure.
-    """
+def launch(
+    run_ids: int | list[int], data_root: str | None = None, out_root: str = ".", smoke: bool = False
+) -> None:
     ids = [run_ids] if isinstance(run_ids, int) else list(run_ids)
-    for i in ids:
-        get_run(i)
+    for run_id in ids:
+        get_run(run_id)
     data_root = find_data_root(data_root)
     n_gpu = _gpu_count()
     slots = max(1, n_gpu)
     log_dir = os.path.join(out_root, "logs")
     os.makedirs(log_dir, exist_ok=True)
-    print(f"runs {ids} | GPUs found: {n_gpu} | data: {data_root} | out: {out_root}")
+    print(f"Runs {ids} | GPUs found: {n_gpu} | data: {data_root} | out: {out_root}")
     if len(ids) > slots:
-        print(f"more runs than GPUs: they will share {slots} card(s) in turn")
+        print(f"More runs than GPUs: they will share {slots} card(s) in turn.")
 
-    pending = list(ids)
-    running = {}          # gpu slot -> (run id, proc, thread)
-    failed = []
+    pending, running, failed = list(ids), {}, []
     while pending or running:
         for slot in range(slots):
-            if slot not in running and pending:
-                rid = pending.pop(0)
-                env = dict(os.environ)
-                if n_gpu:
-                    env["CUDA_VISIBLE_DEVICES"] = str(slot)
-                env["PYTHONUNBUFFERED"] = "1"
-                cmd = [sys.executable, "-u", os.path.join(REPO_DIR, "runner.py"),
-                       "--run-id", str(rid), "--data-root", data_root,
-                       "--out-root", out_root, "--seed", str(seed)]
-                if smoke:
-                    cmd.append("--smoke")
-                if not save_weights:
-                    cmd.append("--no-weights")
-                tag = ("SMOKE_" if smoke else "") + f"{rid:02d}_{RUNS[rid]['name']}_seed{seed}"
-                proc = subprocess.Popen(cmd, cwd=REPO_DIR, env=env, stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT, text=True, bufsize=1)
-                th = threading.Thread(target=_stream, daemon=True,
-                                      args=(proc, f"[{rid:02d}|{'gpu' + str(slot) if n_gpu else 'cpu'}]",
-                                            os.path.join(log_dir, f"{tag}.log")))
-                th.start()
-                running[slot] = (rid, proc, th)
-                print(f"started run {rid} on gpu{slot}" if n_gpu else f"started run {rid} on CPU")
-        for slot, (rid, proc, th) in list(running.items()):
-            if proc.poll() is not None:
-                th.join()
-                if proc.returncode != 0:
-                    failed.append(rid)
-                    print(f"!! run {rid} FAILED (exit {proc.returncode}); see logs/")
-                else:
-                    print(f"run {rid} finished")
-                del running[slot]
+            if slot in running or not pending:
+                continue
+            run_id = pending.pop(0)
+            env = dict(os.environ, PYTHONUNBUFFERED="1")
+            if n_gpu:
+                env["CUDA_VISIBLE_DEVICES"] = str(slot)
+            cmd = [
+                sys.executable,
+                "-u",
+                os.path.join(REPO_DIR, "runner.py"),
+                "--run-id",
+                str(run_id),
+                "--data-root",
+                data_root,
+                "--out-root",
+                out_root,
+            ]
+            if smoke:
+                cmd.append("--smoke")
+            proc = subprocess.Popen(
+                cmd,
+                cwd=REPO_DIR,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            device = f"gpu{slot}" if n_gpu else "cpu"
+            log_path = os.path.join(log_dir, f"{run_tag(run_id, smoke)}.log")
+            thread = threading.Thread(
+                target=_stream, daemon=True, args=(proc, f"[{run_id:02d}|{device}]", log_path)
+            )
+            thread.start()
+            running[slot] = (run_id, proc, thread)
+            print(f"Started run {run_id} on {device}")
+        for slot, (run_id, proc, thread) in list(running.items()):
+            if proc.poll() is None:
+                continue
+            thread.join()
+            if proc.returncode != 0:
+                failed.append(run_id)
+                print(f"Run {run_id} FAILED (exit {proc.returncode}); see logs/")
+            else:
+                print(f"Run {run_id} finished")
+            del running[slot]
         time.sleep(2)
 
     summary(out_root, smoke=smoke)
-    tags = [("SMOKE_" if smoke else "") + f"{rid:02d}_{RUNS[rid]['name']}_seed{seed}" for rid in ids]
-    package(tags, out_root, include_weights=save_weights)
+    package([run_tag(run_id, smoke) for run_id in ids], out_root)
     if failed:
-        raise RuntimeError(f"runs failed: {failed}. Full output is in {log_dir}/")
+        raise RuntimeError(f"Runs failed: {failed}. The full output is in {log_dir}/")
 
 
-def package(tags, out_root=".", include_weights=True):
-    """Put everything a session produced into one zip, so a Kaggle run is one download.
-
-    Holds results/, logs/ and weights/ for the given tags. Weights are stored rather than
-    compressed (safetensors do not shrink and deflating 2 GB is slow), and once the zip is
-    verified the loose weight folders are removed so /kaggle/working is not holding every
-    checkpoint twice. Runs that did not finish are skipped; their logs are still included.
-    """
-    import zipfile
+def package(tags: list[str], out_root: str = ".") -> str | None:
     files = []
     for tag in tags:
         files += glob.glob(os.path.join(out_root, "results", f"{tag}_*"))
         files += glob.glob(os.path.join(out_root, "results", f"cm_{tag}.*"))
         files += glob.glob(os.path.join(out_root, "logs", f"{tag}.log"))
-        if include_weights:
-            for root, _, fs in os.walk(os.path.join(out_root, "weights", tag)):
-                files += [os.path.join(root, f) for f in fs]
+        for root, _, fs in os.walk(os.path.join(out_root, "weights", tag)):
+            files += [os.path.join(root, f) for f in fs]
     if not files:
-        print("nothing to package")
+        print("Nothing to package.")
         return None
-
     ids = "-".join(t.split("_")[1 if t.startswith("SMOKE_") else 0] for t in tags)
     name = ("SMOKE_" if tags[0].startswith("SMOKE_") else "") + f"codraft_runs_{ids}.zip"
     path = os.path.join(out_root, name)
     with zipfile.ZipFile(path, "w", allowZip64=True) as zf:
         for f in sorted(set(files)):
             heavy = os.sep + "weights" + os.sep in f
-            zf.write(f, os.path.relpath(f, out_root),
-                     compress_type=zipfile.ZIP_STORED if heavy else zipfile.ZIP_DEFLATED)
+            zf.write(
+                f,
+                os.path.relpath(f, out_root),
+                compress_type=zipfile.ZIP_STORED if heavy else zipfile.ZIP_DEFLATED,
+            )
     with zipfile.ZipFile(path) as zf:
-        bad = zf.testzip()
-        n = len(zf.namelist())
+        bad, n = zf.testzip(), len(zf.namelist())
     if bad is not None:
-        print(f"!! zip check failed on {bad}; loose files kept")
+        print(f"Zip check failed on {bad}; the loose files are kept.")
         return path
-
-    if include_weights:
-        import shutil
-        for tag in tags:
-            shutil.rmtree(os.path.join(out_root, "weights", tag), ignore_errors=True)
-    print(f"\npackaged {n} files -> {path} ({os.path.getsize(path) / 2**20:.1f} MB)")
-    print("download this one file from the Output panel")
+    for tag in tags:
+        shutil.rmtree(os.path.join(out_root, "weights", tag), ignore_errors=True)
+    print(f"\nPackaged {n} files -> {path} ({os.path.getsize(path) / 2**20:.1f} MB)")
+    print("Download this one file from the Output panel.")
     return path
 
 
-def summary(out_root=".", smoke=False):
-    """One line per finished run, read back from the metrics files."""
+def release_dest(member: str, repo_dir: str = REPO_DIR) -> str | None:
+    weights, data = os.path.join(repo_dir, "weights"), os.path.join(repo_dir, "data")
+    top, base = member.split("/", 1)[0], os.path.basename(member)
+    if top == "results" and base.startswith("cm_") and base.endswith((".png", ".pdf")):
+        return None
+    m = re.search(r"(?<![A-Za-z0-9])(\d\d)_([a-z0-9_.\-]+?)_seed(\d+)", member)
+    if m and not member.startswith(("attributes/", "codraft_")):
+        run_id, tag = int(m.group(1)), m.group(0)
+        if run_id not in RUNS or RUNS[run_id]["name"] != m.group(2):
+            raise ValueError(f"{member}: tag {tag} does not match run {run_id} in config/runs.py")
+        root = os.path.join(weights, RUNS[run_id]["path"])
+        if top == "weights":
+            return os.path.join(root, "model", member.split(tag + "/", 1)[1])
+        if base == f"{tag}.log":
+            return os.path.join(root, "run.log")
+        for suffix, name in RESULT_FILES.items():
+            if base == tag + suffix:
+                return os.path.join(root, name)
+            if base.startswith(tag + "_") and base.endswith(suffix):
+                return os.path.join(root, "conditions", base[len(tag) + 1 :])
+        raise ValueError(f"{member}: no place for this file of {tag}")
+    m = re.match(
+        r"llm_(.+?)_(\d+shot)_([a-z0-9_.\-]+?)(_preds\.csv|_metrics\.json|_raw\.jsonl)$", base
+    )
+    if top == "results" and m:
+        llm, shots, inp, kind = m.groups()
+        return os.path.join(weights, "llm-classifiers", llm, f"{shots}_{inp}", RESULT_FILES[kind])
+    if top.startswith("codraft_"):
+        return os.path.join(data, member)
+    if top == "attributes":
+        if base.endswith("_raw.jsonl"):
+            return os.path.join(
+                weights, "llm-classifiers", base[: -len("_raw.jsonl")], "enrich_raw.jsonl"
+            )
+        return os.path.join(data, "attributes", base)
+    if top == "logs":
+        if base.startswith("vllm_"):
+            return os.path.join(
+                weights, "llm-classifiers", base[len("vllm_") : -len(".log")], "vllm.log"
+            )
+        m = re.match(r"(.+?)_((?:enrich|classify)(?:-(?:enrich|classify))?)\.log$", base)
+        if m:
+            return os.path.join(weights, "llm-classifiers", m.group(1), "run.log")
+    raise ValueError(f"{member}: no place for it in weights/ or data/")
+
+
+def install(zip_path: str, repo_dir: str = REPO_DIR, keep_zip: bool = False) -> list[str]:
+    with zipfile.ZipFile(zip_path) as z:
+        if z.testzip() is not None:
+            raise ValueError(f"{zip_path} is damaged")
+        plan = [(i, release_dest(i.filename, repo_dir)) for i in z.infolist() if not i.is_dir()]
+        skipped = sum(d is None for _, d in plan)
+        plan = [(i, d) for i, d in plan if d is not None]
+        dsts = [d for _, d in plan]
+        clash = sorted(
+            {d for d in dsts if dsts.count(d) > 1} | {d for d in dsts if os.path.exists(d)}
+        )
+        if clash:
+            raise FileExistsError(f"Would overwrite {len(clash)} files, e.g. {clash[:3]}")
+        for info, dst in plan:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with z.open(info) as src, open(dst, "wb") as out:
+                shutil.copyfileobj(src, out, 1 << 24)
+            if os.path.getsize(dst) != info.file_size:
+                raise OSError(f"{dst}: size differs from the zip")
+    if not keep_zip:
+        os.remove(zip_path)
+    where = sorted(
+        {os.path.relpath(os.path.dirname(d), repo_dir).split(os.sep + "model")[0] for d in dsts}
+    )
+    skipped_note = f"; {skipped} figures skipped" if skipped else ""
+    deleted_note = "" if keep_zip else "; zip deleted"
+    print(
+        f"{os.path.basename(zip_path)}: {len(plan)} files -> {', '.join(where)}{skipped_note}{deleted_note}"
+    )
+    return dsts
+
+
+def summary(out_root: str = ".", smoke: bool = False) -> None:
     files = sorted(glob.glob(os.path.join(out_root, "results", "*_metrics.json")))
     files = [f for f in files if os.path.basename(f).startswith("SMOKE_") == smoke]
     if not files:
-        print("no finished runs yet")
+        print("No finished runs yet.")
         return
     print(f"\n{'run':<38}{'MacroF1':>8}{'QWK':>8}{'MAE':>8}{'adj':>8}{'n':>6}{'min':>7}")
     for f in files:
-        r = json.load(open(f))
-        print(f"{r['tag']:<38}{r['f1_macro']*100:8.2f}{r['qwk']:8.4f}{r['mae']:8.4f}"
-              f"{r['adjacent_acc']*100:7.2f}%{r['n_test']:6d}{r['train_seconds']/60:7.1f}")
+        with open(f) as fh:
+            r = json.load(fh)
+        print(
+            f"{r['tag']:<38}{r['f1_macro'] * 100:8.2f}{r['qwk']:8.4f}{r['mae']:8.4f}"
+            f"{r['adjacent_acc'] * 100:7.2f}%{r['n_test']:6d}{r['train_seconds'] / 60:7.1f}"
+        )
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+def main() -> None:
+    ap = argparse.ArgumentParser()
     ap.add_argument("--run-id", type=int)
     ap.add_argument("--data-root", default=None)
     ap.add_argument("--out-root", default=".")
-    ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    ap.add_argument("--smoke", action="store_true",
-                    help="tiny subset, one epoch: checks the pipeline in minutes")
-    ap.add_argument("--no-weights", action="store_true")
+    ap.add_argument("--smoke", action="store_true", help="tiny subset, one epoch")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument(
+        "--install", nargs="+", metavar="ZIP", help="unpack session zips into weights/ and data/"
+    )
+    ap.add_argument("--keep-zip", action="store_true", help="with --install: keep the zip")
     a = ap.parse_args()
-    if a.list or a.run_id is None:
+    if a.install:
+        for z in a.install:
+            install(z, keep_zip=a.keep_zip)
+    elif a.list or a.run_id is None:
         print(describe())
-        return
-    run_experiment(a.run_id, data_root=a.data_root, out_root=a.out_root, seed=a.seed,
-                   smoke=a.smoke, save_weights=not a.no_weights)
+    else:
+        run_experiment(a.run_id, data_root=a.data_root, out_root=a.out_root, smoke=a.smoke)
 
 
 if __name__ == "__main__":

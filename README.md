@@ -1,84 +1,111 @@
 # CoDraft-Bench
 
-Code for **CoDraft: Taxonomy-Grounded Enrichment for Benchmarking Ordinal Product Similarity
-in Intellectual Property Litigation**.
+Code for **CoDraft: Taxonomy-Grounded Enrichment for Benchmarking Ordinal Product Similarity in
+Intellectual Property Litigation**.
 
-Given two trademark product names, predict the 5-level ordinal similarity label EUIPO
-opposition rulings use: `Dissimilar (0)`, `Low similar (1)`, `Similar (2)`,
-`High similar (3)`, `Identical (4)`.
+The task: given two product names from EUIPO opposition decisions, predict their similarity on a
+5-level scale: Dissimilar (0), Low similar (1), Similar (2), High similar (3), Identical (4).
 
 ## Layout
 
 ```
-runner.py             runs any experiment end to end: python runner.py --run-id 7
-config/runs.py        every experiment in the paper, keyed by run ID (20 runs)
-codraft_enrichment/   LLM enrichment: a product name T plus its NICE class heading C
-                      becomes (Nature, Purpose, expanded name)
-config/               CONFIG_DATA (NICE class map, class tokens), CONFIG_MODEL (hyperparameters)
-preprocess/           DataManager: loads the splits, builds the inputs and datasets
-model/                MultiTask (the main model), the baselines, Rank-Aware Focal Loss
-utils/                metrics, prediction helpers, seeding
-scripts/run.ipynb     the one notebook: set RUN_ID, then Run All
-data/                 the splits (gitignored)
+runner.py              trains and scores one experiment; --install unpacks a Kaggle zip
+llm_runner.py          runs an LLM: enrichment (Nature, Purpose) or direct classification
+config/runs.py         every experiment, by run ID, with the folder it is kept in
+config/llms.py         every LLM, by tag
+config/config_model.py hyperparameters
+config/config_data.py  NICE class headings and class tokens
+preprocess/            data loading and model inputs
+model/                 the Multi-Task Cross-Encoder and the baselines
+codraft_enrichment/    the LLM client, the enrichment prompt and the LLM classifier
+utils/                 metrics and prediction helpers
+analysis/group_a.py    CPU analyses of the saved predictions
+scripts/run.ipynb      notebook for runner.py
+scripts/llm.ipynb      notebook for llm_runner.py
 ```
 
 ## Data
 
-`data/` is gitignored, so fetch the dataset separately and unpack it there:
+The data is not in git. Put it in `data/`:
 
 ```
 data/
-  codraft/   train.csv  val.csv  test.csv    name + LLM Nature/Purpose + NICE heading
-  plain/     train.csv  val.csv  test.csv    bare product name
-  category/  train.csv  val.csv  test.csv    name + NICE heading only
-  expanded/  train.csv  val.csv  test.csv    LLM-rewritten name
-  term_attributes.csv                        attribute cache, one row per unique term
+  plain/                 product name only
+  category/              product name + NICE class heading
+  codraft/               product name + Nature + Purpose (Gemini 2.5 Flash) + heading
+  expanded/              product name rewritten by Gemini 2.5 Flash
+  codraft_<llm>/         like codraft/, with Nature and Purpose from an open LLM
+  term_attributes.csv    Gemini attributes, one row per term
+  attributes/            open-LLM attributes (<llm>_attributes.csv) and run details (<llm>_enrich.json)
 ```
 
-21,340 pairs split 70/10/20 (14,939 / 2,135 / 4,266), stratified by label. **The four
-variants are row-aligned**: same `Pair ID` set, same order, same labels, so any two runs
-compare pair by pair. `data/README.md` has the full description.
+Each folder has `train.csv`, `val.csv` and `test.csv`: 14,939 / 2,135 / 4,266 pairs (21,340 in
+total), split 70/10/20 and stratified by label. All folders have the same pairs in the same order,
+so any two runs can be compared pair by pair.
 
-## Running
+| label | pairs |
+|---|---|
+| Dissimilar | 11,799 |
+| Low similar | 807 |
+| Similar | 2,718 |
+| High similar | 388 |
+| Identical | 5,628 |
 
-Every experiment has an ID in `config/runs.py`:
+## Train and score
 
 ```bash
-python runner.py --list              # the 20 runs
+pip install -r requirements.txt
+python runner.py --list              # all runs
 python runner.py --run-id 7          # the full model
-python runner.py --run-id 7 --smoke  # tiny subset, one epoch: checks the pipeline
+python runner.py --run-id 7 --smoke  # a quick check on a tiny subset
 ```
 
-or open `scripts/run.ipynb`, set `RUN_ID`, and Run All. On Kaggle the notebook clones this
-repo at branch `new`, installs `requirements.txt` and finds the dataset under
-`/kaggle/input`. Pick the **GPU T4 x2** accelerator for every run so all runs share the same
-hardware.
+On Kaggle, open `scripts/run.ipynb`, set `RUN_ID` and `SMOKE`, choose GPU T4 x2, then Run All.
+Each run uses one GPU; `RUN_ID = [7, 12]` runs two at once. Download the zip at the end and unpack
+it:
 
-**Every run uses exactly one GPU**, so each family trains under the same conditions; only the
-multi-task model could use two through `Trainer`, and the baselines cannot. A list such as
-`RUN_ID = [7, 12]` runs two experiments at once, one per card.
-
-Each run writes, under its tag `<ID>_<name>_seed42`:
-
-```
-results/<tag>_preds.csv      per-example predictions, carrying Pair ID
-results/<tag>_metrics.json   every metric, the run spec, the settings and the environment
-results/<tag>_logits.npy     averaged logits (multi-task only)
-results/cm_<tag>.pdf/.png    confusion matrix
-weights/<tag>/               the trained model
-logs/<tag>.log               full console output
+```bash
+python runner.py --install codraft_runs_7-12.zip
 ```
 
-## Enrichment
+## LLM runs
 
-```python
-from codraft_enrichment import get_client, run_enrichment
+```bash
+pip install -r requirements-llm.txt vllm==0.30.0
+python llm_runner.py --list
+python llm_runner.py --llm qwen3-8b --task enrich classify
 ```
 
-Needs an API key for the endpoint in `CONFIG_DATA.CODRAFT_CONFIG`; put it in `.env`, which
-is gitignored. `data/term_attributes.csv` is the cache of what the pipeline already
-produced, so the experiments reproduce without API calls.
+`enrich` writes the attributes and the `codraft_<llm>/` data folder. `classify` asks the LLM for
+the label of every test pair, with 0 and 10 examples, on the `plain`, `codraft` and `own` inputs
+(`own` is the LLM's own attributes). On Kaggle use `scripts/llm.ipynb`: set the variables in the
+first cell, choose GPU T4 x2, then Run All. Gated models need the Kaggle secret `HF_TOKEN`. A run
+that stopped can continue from its zip with `RESUME_FROM`.
 
-## Licence
+## Results
+
+`python runner.py --install <zip>` puts every result in `weights/`, named by what it is:
+
+```
+weights/
+  codraft/                                  the full model (run 7)
+  baselines/<model>_<backbone>_<input>/     runs 1-6, 8-11, 20
+  ablations/<what is removed>/              runs 12-19
+  enrichment-llms/<llm>/                    run 7 on an open LLM's attributes (runs 21-24)
+  binary/codraft_binary-trained/            run 7 on the binary target (run 25)
+  llm-classifiers/<llm>/<k>shot_<input>/    the LLM classifier
+```
+
+Each folder holds `preds.csv` (one row per test pair) and `metrics.json`. The full folders, with
+`model/`, `logits.npy` and `run.log`, are in the release zips, one per subfolder of `weights/`.
+
+## Checks and analyses
+
+```bash
+python llm_runner.py --check         # data/codraft/ rebuilds from term_attributes.csv; metrics match
+python -m analysis.group_a           # writes analysis/out/group_a.md
+```
+
+## License
 
 MIT, see `LICENSE`.

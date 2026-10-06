@@ -1,7 +1,4 @@
 class CONFIG_DATA:
-
-    TARGET_SAMPLES = 3000
-    MAX_SAMPLES_CLASS_0 = 4500
     MAX_LEN = 256
 
     NICE_CLASS_MAP = {
@@ -49,20 +46,11 @@ class CONFIG_DATA:
         42: "Technology services, Software development, IT consulting",
         43: "Food and drink services, Restaurants, Hotels",
         44: "Medical services, Hygiene, Beauty care (Spa/Salon)",
-        45: "Legal services, Security services, Social services"
+        45: "Legal services, Security services, Social services",
     }
 
-    # One dedicated token per NICE class. create_patterns prepends the class token of the
-    # unmasked side and [MASK] on the other, and the auxiliary head predicts the masked
-    # side's class from the [MASK] hidden state. These must be registered with the
-    # tokenizer (get_tokenizer(add_class_tokens=True)); otherwise SentencePiece splits
-    # "[CLASS_11]" into ordinary subwords and the resize below it does nothing.
     CLASS_TOKENS = [f"[CLASS_{i}]" for i in range(1, 46)]
 
-    # The official class headings (Nice Classification, 12th edition), which the enrichment
-    # prompt receives as each term's "Description". NICE_CLASS_MAP above is a short paraphrase
-    # used in the model input ("Category: ..."); the two are not interchangeable. Gemini's
-    # traces in term_attributes.csv quote these headings ("Clothing, footwear, headwear").
     NICE_CLASS_HEADINGS = {
         1: "Chemicals for use in industry, science and photography, as well as in agriculture, horticulture and forestry; unprocessed artificial resins, unprocessed plastics; fire extinguishing and fire prevention compositions; tempering and soldering preparations; substances for tanning animal skins and hides; adhesives for use in industry; putties and other paste fillers; compost, manures, fertilizers; biological preparations for use in industry and science.",
         2: "Paints, varnishes, lacquers; preservatives against rust and against deterioration of wood; colorants, dyes; inks for printing, marking and engraving; raw natural resins; metals in foil and powder form for use in painting, decorating, printing and art.",
@@ -109,9 +97,4 @@ class CONFIG_DATA:
         43: "Services for providing food and drink; temporary accommodation.",
         44: "Medical services; veterinary services; hygienic and beauty care for human beings or animals; agriculture, aquaculture, horticulture and forestry services.",
         45: "Legal services; security services for the physical protection of tangible property and individuals; dating services, online social networking services; funeral services; babysitting.",
-    }
-
-    CODRAFT_CONFIG = {
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "batch_size": 30,
     }
