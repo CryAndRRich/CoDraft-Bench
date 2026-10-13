@@ -71,7 +71,7 @@ def classify(
     out_path: str,
     demos: pd.DataFrame | None = None,
     workers: int = 32,
-    rescue_sampling: dict | None = None,
+    rescue_sampling: dict | None = None
 ) -> tuple[list[int | None], dict]:
     done = {}
     if os.path.isfile(out_path):
@@ -90,13 +90,13 @@ def classify(
             user_prompt(r["input_text_1"], r["input_text_2"], demos),
             Verdict,
             max_tokens=32,
-            sampling=sampling,
+            sampling=sampling
         )
         rec = {
             "Pair ID": r["Pair ID"],
             "label": int(r["label_score"]),
             "pred": LABELS.index(out.label) if out else None,
-            "error": info["error"],
+            "error": info["error"]
         }
         if sampling:
             rec["rescued"] = True
@@ -135,7 +135,7 @@ def classify(
         seconds=round(time.time() - t0, 1),
         prompt_version=PROMPT_VERSION,
         n_demonstrations=0 if demos is None else len(demos),
-        demonstration_ids=[] if demos is None else list(demos["Pair ID"]),
+        demonstration_ids=[] if demos is None else list(demos["Pair ID"])
     )
     stats["n_errors"] = len(stats["errors"])
     stats["errors"] = stats["errors"][:50]

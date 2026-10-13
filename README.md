@@ -1,7 +1,7 @@
 # CoDraft-Bench
 
-Code for **CoDraft: Taxonomy-Grounded Enrichment for Benchmarking Ordinal Product Similarity in
-Intellectual Property Litigation**.
+Code for **Five Shades of Grey: Taxonomy-grounded Semantic Enrichment for Ordinal Product
+Similarity**.
 
 The task: given two product names from EUIPO opposition decisions, predict their similarity on a
 5-level scale: Dissimilar (0), Low similar (1), Similar (2), High similar (3), Identical (4).
@@ -19,7 +19,6 @@ preprocess/            data loading and model inputs
 model/                 the Multi-Task Cross-Encoder and the baselines
 codraft_enrichment/    the LLM client, the enrichment prompt and the LLM classifier
 utils/                 metrics and prediction helpers
-analysis/group_a.py    CPU analyses of the saved predictions
 scripts/run.ipynb      notebook for runner.py
 scripts/llm.ipynb      notebook for llm_runner.py
 ```
@@ -60,7 +59,8 @@ python runner.py --run-id 7          # the full model
 python runner.py --run-id 7 --smoke  # a quick check on a tiny subset
 ```
 
-On Kaggle, open `scripts/run.ipynb`, set `RUN_ID` and `SMOKE`, choose GPU T4 x2, then Run All.
+On Kaggle, attach this code and the data as input datasets, open `scripts/run.ipynb`, set `RUN_ID`
+and `SMOKE`, choose GPU T4 x2, then Run All.
 Each run uses one GPU; `RUN_ID = [7, 12]` runs two at once. Download the zip at the end and unpack
 it:
 
@@ -103,7 +103,6 @@ Each folder holds `preds.csv` (one row per test pair) and `metrics.json`. The fu
 
 ```bash
 python llm_runner.py --check         # data/codraft/ rebuilds from term_attributes.csv; metrics match
-python -m analysis.group_a           # writes analysis/out/group_a.md
 ```
 
 ## License

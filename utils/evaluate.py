@@ -15,9 +15,7 @@ from preprocess.data_loader import PairSiameseDataset, collate_siamese
 
 
 def get_preds_multi(
-    trainer: Trainer,
-    test_ds: object,
-    df_test: pd.DataFrame,
+    trainer: Trainer, test_ds: object, df_test: pd.DataFrame
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     predictions = trainer.predict(test_ds).predictions
     if isinstance(predictions, tuple):
@@ -40,7 +38,7 @@ def build_result_df(
             "label": test_true,
             "pred": test_preds,
             "Class 1": df_test["Class 1"].values,
-            "Class 2": df_test["Class 2"].values,
+            "Class 2": df_test["Class 2"].values
         }
     )
 
@@ -51,10 +49,7 @@ def get_preds_cross_encoder(model: object, df_test: pd.DataFrame) -> tuple[np.nd
 
 
 def get_preds_siamese(
-    test_df: pd.DataFrame,
-    model_path: str,
-    model_name: str,
-    device: torch.device,
+    test_df: pd.DataFrame, model_path: str, model_name: str, device: torch.device
 ) -> tuple[np.ndarray, np.ndarray]:
     model = get_model_bi_encoder_baseline(model_name, num_classes=CONFIG_MODEL.NUM_CLASSES)
     state = torch.load(os.path.join(model_path, "siamese_state.pth"), map_location=device)
@@ -65,7 +60,7 @@ def get_preds_siamese(
         PairSiameseDataset(test_df, model.encoder.tokenizer, max_len=CONFIG_DATA.MAX_LEN),
         batch_size=CONFIG_MODEL.MODEL_CONFIG["siamese"]["batch_size"],
         shuffle=False,
-        collate_fn=collate_siamese,
+        collate_fn=collate_siamese
     )
     preds = []
     with torch.no_grad():
@@ -74,7 +69,7 @@ def get_preds_siamese(
                 batch["ids1"].to(device),
                 batch["mask1"].to(device),
                 batch["ids2"].to(device),
-                batch["mask2"].to(device),
+                batch["mask2"].to(device)
             )
             preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
     return np.array(preds), test_df["label_score"].values
@@ -91,5 +86,5 @@ def compute_metrics(eval_pred: EvalPrediction) -> dict:
         "accuracy": float(accuracy_score(labels, preds)),
         "f1_macro": float(f1_score(labels, preds, average="macro")),
         "qwk": float(cohen_kappa_score(labels, preds, weights="quadratic")),
-        "mae": float(mean_absolute_error(labels, preds)),
+        "mae": float(mean_absolute_error(labels, preds))
     }

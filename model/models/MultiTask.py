@@ -33,13 +33,10 @@ class JointClassSimBGE(XLMRobertaPreTrainedModel):
         labels: torch.Tensor | None = None,
         aux_labels: torch.Tensor | None = None,
         num_items_in_batch: int | None = None,
-        **kwargs: object,
+        **kwargs: object
     ) -> SequenceClassifierOutput:
         outputs = self.roberta(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            **kwargs,
+            input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, **kwargs
         )
         hidden = outputs.last_hidden_state
         logits_sim = self.classifier(hidden[:, 0, :])
@@ -58,8 +55,7 @@ class JointClassSimBGE(XLMRobertaPreTrainedModel):
             loss = loss_fct(logits_sim.view(-1, self.num_labels), labels.view(-1))
             if aux_labels is not None and self.training:
                 loss_aux = nn.CrossEntropyLoss()(
-                    logits_aux.view(-1, self.num_product_classes),
-                    aux_labels.view(-1),
+                    logits_aux.view(-1, self.num_product_classes), aux_labels.view(-1)
                 )
                 loss = loss + self.aux_weight * loss_aux
         return SequenceClassifierOutput(loss=loss, logits=logits_sim)
@@ -74,7 +70,7 @@ def get_model_multi_task(
     device: torch.device,
     tokenizer: PreTrainedTokenizer,
     loss_type: str = "rank_aware",
-    class_weights: list | None = None,
+    class_weights: list | None = None
 ) -> JointClassSimBGE:
     config = AutoConfig.from_pretrained(model_name)
     config.num_labels = num_classes

@@ -15,7 +15,7 @@ ERROR_WORDS = (
     "CUDA out of memory",
     "not supported",
     "does not support",
-    "Unsupported",
+    "Unsupported"
 )
 
 
@@ -26,7 +26,7 @@ class VLLMServer:
         port: int = 8000,
         log_path: str = "vllm.log",
         seed: int = 0,
-        startup_timeout: int = 3600,
+        startup_timeout: int = 3600
     ) -> None:
         self.spec = spec
         self.port = port
@@ -58,7 +58,7 @@ class VLLMServer:
             "--gpu-memory-utilization",
             str(s["gpu_memory_utilization"]),
             "--seed",
-            str(self.seed),
+            str(self.seed)
         ]
 
     def __enter__(self) -> "VLLMServer":
@@ -70,7 +70,7 @@ class VLLMServer:
             cmd,
             stdout=self.log,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env={**os.environ, "PYTHONUNBUFFERED": "1"}
         )
         t0 = time.time()
         while True:
@@ -134,9 +134,7 @@ class VLLMServer:
 
 
 def strict_schema(
-    model: type[BaseModel],
-    max_items: dict | None = None,
-    min_items: dict | None = None,
+    model: type[BaseModel], max_items: dict | None = None, min_items: dict | None = None
 ) -> dict:
     schema = copy.deepcopy(model.model_json_schema())
     max_items, min_items = max_items or {}, min_items or {}
@@ -163,12 +161,7 @@ class LLMClient:
     MAX_CONSECUTIVE_ERRORS = 20
 
     def __init__(
-        self,
-        spec: dict,
-        base_url: str,
-        api_key: str = "EMPTY",
-        seed: int = 0,
-        timeout: int = 600,
+        self, spec: dict, base_url: str, api_key: str = "EMPTY", seed: int = 0, timeout: int = 600
     ) -> None:
         self.spec = spec
         self.seed = seed
@@ -184,7 +177,7 @@ class LLMClient:
             return [{"role": "system", "content": system}, {"role": "user", "content": user}]
         return [
             {"role": "system", "content": mode},
-            {"role": "user", "content": f"{system}\n\n{user}"},
+            {"role": "user", "content": f"{system}\n\n{user}"}
         ]
 
     def json(
@@ -195,7 +188,7 @@ class LLMClient:
         max_tokens: int,
         schema: dict | None = None,
         attempts: int = 4,
-        sampling: dict | None = None,
+        sampling: dict | None = None
     ) -> tuple[BaseModel | None, dict]:
         kw = dict(
             model=self.model,
@@ -207,9 +200,9 @@ class LLMClient:
                 "json_schema": {
                     "name": response_model.__name__,
                     "schema": schema or response_model.model_json_schema(),
-                    "strict": True,
-                },
-            },
+                    "strict": True
+                }
+            }
         )
         if self.spec["backend"] == "vllm":
             kw["seed"] = self.seed
@@ -288,7 +281,7 @@ def package_versions() -> dict:
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=30
         )
         out["gpus"] = [line.strip() for line in r.stdout.splitlines() if line.strip()]
     except Exception:

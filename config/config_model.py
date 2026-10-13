@@ -11,16 +11,12 @@ class CONFIG_MODEL:
     WEIGHT_DECAY = 0.02
 
     MODEL_CONFIG = {
-        "cross_encoder": {
-            "epochs": 5,
-            "evaluation_steps": 500,
-        },
+        "cross_encoder": {"epochs": 5, "evaluation_steps": 500, "batch_size": 32},
         "siamese": {
             "num_epochs_cls": 5,
             "lr": LEARNING_RATE / 2,
             "batch_size": 32,
-            "physical_batch_size": 32,
-            "num_workers": 2,
+            "num_workers": 2
         },
         "multi_task": {
             "training_args": {
@@ -47,12 +43,9 @@ class CONFIG_MODEL:
                 "fp16": torch.cuda.is_available(),
                 "seed": 42,
                 "data_seed": 42,
-                "remove_unused_columns": False,
+                "remove_unused_columns": False
             },
-            "loss_args": {
-                "alpha": 0.47,
-                "aux_weight": 0.26,
-            },
+            "loss_args": {"alpha": 0.47, "aux_weight": 0.26}
         },
         "xgboost": {
             "model_args": {
@@ -62,12 +55,10 @@ class CONFIG_MODEL:
                 "subsample": 0.8,
                 "colsample_bytree": 0.8,
                 "random_state": 42,
-                "early_stopping_rounds": 20,
+                "early_stopping_rounds": 20
             },
-            "train_args": {
-                "verbose": 10,
-            },
-        },
+            "train_args": {"verbose": 10}
+        }
     }
 
     @classmethod

@@ -98,7 +98,7 @@ def enrich_task(
     scope: str,
     smoke: bool,
     batch_size: int,
-    workers: int,
+    workers: int
 ) -> list[str]:
     from codraft_enrichment.enrich import enrich, norm, term_table
     from codraft_enrichment.variant import build_variant
@@ -132,7 +132,7 @@ def enrich_task(
         tag,
         batch_size=batch_size,
         workers=workers,
-        rescue_sampling=_rescue(spec),
+        rescue_sampling=_rescue(spec)
     )
     os.makedirs(attr_dir, exist_ok=True)
     path = os.path.join(attr_dir, f"{tag}_attributes.csv")
@@ -150,7 +150,7 @@ def enrich_task(
             vname,
             out_root=variant_root,
             splits=("test",) if smoke else None,
-            pair_ids=smoke_ids,
+            pair_ids=smoke_ids
         )
     except ValueError as e:
         print(f"No variant written: {e}")
@@ -162,7 +162,7 @@ def enrich_task(
         "smoke": smoke,
         "attributes": os.path.relpath(path, out_root),
         "variant_splits": written,
-        **st,
+        **st
     }
     meta_path = os.path.join(attr_dir, f"{tag}_enrich.json")
     with open(meta_path, "w") as fh:
@@ -182,7 +182,7 @@ def classify_task(
     variants: list[str],
     shots: list[int],
     smoke: bool,
-    workers: int,
+    workers: int
 ) -> list[str]:
     from codraft_enrichment.classify import classify, demonstrations, load_pairs
     from utils.metrics import plot_confusion, stats
@@ -224,7 +224,7 @@ def classify_task(
                 os.path.join(res, f"{tag}_raw.jsonl"),
                 demos=demonstrations(train, k=k) if k else None,
                 workers=workers,
-                rescue_sampling=_rescue(spec),
+                rescue_sampling=_rescue(spec)
             )
             unanswered = sum(p is None for p in preds)
             if unanswered:
@@ -238,7 +238,7 @@ def classify_task(
                     "label": y,
                     "pred": p,
                     "Class 1": test["Class 1"],
-                    "Class 2": test["Class 2"],
+                    "Class 2": test["Class 2"]
                 }
             ).to_csv(os.path.join(res, f"{tag}_preds.csv"), index=False)
             plot_confusion(m["confusion_matrix"], os.path.join(res, f"cm_{tag}"))
@@ -252,7 +252,7 @@ def classify_task(
                 "adjacent_acc",
                 "severe_rate",
                 "per_class",
-                "confusion_matrix",
+                "confusion_matrix"
             )
             record = {
                 **meta,
@@ -264,7 +264,7 @@ def classify_task(
                 "shots": k,
                 "n_test": len(test),
                 **{key: m[key] for key in keys},
-                "settings": st,
+                "settings": st
             }
             with open(os.path.join(res, f"{tag}_metrics.json"), "w") as fh:
                 json.dump(record, fh, indent=2, default=str)
@@ -292,7 +292,7 @@ def _tasks(
     batch_size: int,
     workers: int,
     port: int,
-    seed: int,
+    seed: int
 ) -> None:
     from codraft_enrichment.llm import make_client, package_versions, served_revision
 
@@ -309,7 +309,7 @@ def _tasks(
         "environment": package_versions(),
         "seed": seed,
         "temperature": 0,
-        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "started": time.strftime("%Y-%m-%d %H:%M:%S")
     }
     print("Revision:", meta["revision"], "| environment:", json.dumps(meta["environment"]))
     with _server(spec, out_root, port) as server:
@@ -321,15 +321,7 @@ def _tasks(
         if "classify" in tasks:
             classify_workers = max(workers, 32) if spec["backend"] == "vllm" else workers
             files += classify_task(
-                client,
-                spec,
-                meta,
-                data_root,
-                out_root,
-                variants,
-                shots,
-                smoke,
-                classify_workers,
+                client, spec, meta, data_root, out_root, variants, shots, smoke, classify_workers
             )
 
 
@@ -346,7 +338,7 @@ def run_llm(
     workers: int | None = None,
     port: int = 8000,
     seed: int = 0,
-    resume_from: str | None = None,
+    resume_from: str | None = None
 ) -> str:
     spec = get_llm(llm)
     data_root = find_data_root(data_root)
@@ -373,7 +365,7 @@ def run_llm(
                     batch_size or spec["batch_size"],
                     workers or spec["workers"],
                     port,
-                    seed,
+                    seed
                 )
             except BaseException:
                 traceback.print_exc(file=sys.stdout)
@@ -384,7 +376,7 @@ def run_llm(
             f"attributes/{name}_*",
             f"results/{prefix}llm_{spec['tag']}_*",
             f"results/cm_{prefix}llm_{spec['tag']}_*",
-            f"logs/vllm_{spec['tag']}.log",
+            f"logs/vllm_{spec['tag']}.log"
         ):
             files += glob.glob(os.path.join(out_root, pattern))
         zip_name = f"{prefix}codraft_llm_{spec['tag']}_{'-'.join(tasks)}" + (
@@ -433,7 +425,7 @@ def check(data_root: str | None = None) -> None:
             "precision_macro",
             "recall_macro",
             "adjacent_acc",
-            "severe_rate",
+            "severe_rate"
         ):
             assert abs(m[k] - r[k]) < 1e-9, (r["tag"], k, m[k], r[k])
         assert m["confusion_matrix"] == r["confusion_matrix"], r["tag"]
@@ -478,7 +470,7 @@ def main() -> None:
             batch_size=a.batch_size,
             workers=a.workers,
             port=a.port,
-            resume_from=a.resume_from,
+            resume_from=a.resume_from
         )
 
 

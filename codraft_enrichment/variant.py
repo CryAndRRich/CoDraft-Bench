@@ -23,7 +23,7 @@ def build_variant(
     name: str,
     out_root: str | None = None,
     splits: tuple[str, ...] | None = None,
-    pair_ids: list[str] | None = None,
+    pair_ids: list[str] | None = None
 ) -> dict:
     attrs, by_class = load_attributes(attributes_csv)
     out_dir = os.path.join(out_root or data_root, name)

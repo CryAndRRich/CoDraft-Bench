@@ -21,7 +21,7 @@ ATTRIBUTE_COLUMNS = [
     "Expanded_Name",
     "Logic_Trace",
     "Brainstorming",
-    "mode",
+    "mode"
 ]
 
 
@@ -46,7 +46,7 @@ def term_table(data_root: str, scope: str = "all", gemini_cache: str | None = No
             "key": k,
             "Class": c,
             "Term": casing.get(k, t),
-            "Description": CONFIG_DATA.NICE_CLASS_HEADINGS[c],
+            "Description": CONFIG_DATA.NICE_CLASS_HEADINGS[c]
         }
         for (k, c), t in seen.items()
     ]
@@ -68,7 +68,7 @@ def _record(row: dict, item: NiceCoDraft, mode: str) -> dict:
         "Logic_Trace": str(item.step2_context_verification).strip(),
         "Brainstorming": json.dumps(list(item.step1_brainstorming), ensure_ascii=False),
         "returned_term": str(item.original_term),
-        "mode": mode,
+        "mode": mode
     }
 
 
@@ -80,7 +80,7 @@ def enrich(
     batch_size: int = 10,
     workers: int = 16,
     tokens_per_term: int = 400,
-    rescue_sampling: dict | None = None,
+    rescue_sampling: dict | None = None
 ) -> tuple[pd.DataFrame, dict]:
     os.makedirs(out_dir, exist_ok=True)
     raw_path = os.path.join(out_dir, f"{name}_raw.jsonl")
@@ -104,7 +104,7 @@ def enrich(
         schema = strict_schema(
             BatchAnalysis,
             max_items={"items": len(rows), "step1_brainstorming": 5},
-            min_items={"items": len(rows)},
+            min_items={"items": len(rows)}
         )
         user = USER_PROMPT.format(batch_json=json.dumps(batch, indent=2, ensure_ascii=False))
         out, info = client.json(
@@ -113,7 +113,7 @@ def enrich(
             BatchAnalysis,
             schema=schema,
             max_tokens=tokens_per_term * len(rows) + 256,
-            sampling=sampling,
+            sampling=sampling
         )
         items = list(out.items) if out else []
         matched, missing = [], []
@@ -154,7 +154,7 @@ def enrich(
                 if n % max(1, len(groups) // 20) == 0 or n == len(groups):
                     print(
                         f"[{desc}] {n}/{len(groups)} calls | {len(done)} terms done | {time.time() - t0:.0f}s",
-                        flush=True,
+                        flush=True
                     )
         return left
 
@@ -187,7 +187,7 @@ def enrich(
         batch_size=batch_size,
         workers=workers,
         prompt_version=PROMPT_VERSION,
-        rescue_sampling=rescue_sampling,
+        rescue_sampling=rescue_sampling
     )
     stats["n_errors"] = len(stats["errors"])
     stats["errors"] = stats["errors"][:50]

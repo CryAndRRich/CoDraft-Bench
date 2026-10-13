@@ -46,7 +46,7 @@ class CONFIG_DATA:
         42: "Technology services, Software development, IT consulting",
         43: "Food and drink services, Restaurants, Hotels",
         44: "Medical services, Hygiene, Beauty care (Spa/Salon)",
-        45: "Legal services, Security services, Social services",
+        45: "Legal services, Security services, Social services"
     }
 
     CLASS_TOKENS = [f"[CLASS_{i}]" for i in range(1, 46)]
@@ -96,5 +96,5 @@ class CONFIG_DATA:
         42: "Scientific and technological services and research and design relating thereto; industrial analysis, industrial research and industrial design services; quality control and authentication services; design and development of computer hardware and software.",
         43: "Services for providing food and drink; temporary accommodation.",
         44: "Medical services; veterinary services; hygienic and beauty care for human beings or animals; agriculture, aquaculture, horticulture and forestry services.",
-        45: "Legal services; security services for the physical protection of tangible property and individuals; dating services, online social networking services; funeral services; babysitting.",
+        45: "Legal services; security services for the physical protection of tangible property and individuals; dating services, online social networking services; funeral services; babysitting."
     }

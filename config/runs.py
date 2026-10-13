@@ -9,126 +9,126 @@ RUNS = {
         family="xgboost",
         model=None,
         variant="plain",
-        table="Table 2",
-        row="XGBoost via TF-IDF (vanilla)",
-        path="baselines/xgboost-tfidf_plain",
+        table="Table 3",
+        row="XGBoost (TF-IDF), vanilla",
+        path="baselines/xgboost-tfidf_plain"
     ),
     2: dict(
         name="xgboost_codraft",
         family="xgboost",
         model=None,
         variant="codraft",
-        table="Table 2",
-        row="XGBoost via TF-IDF (w/ CoDraft)",
-        path="baselines/xgboost-tfidf_codraft",
+        table="Table 3",
+        row="XGBoost (TF-IDF), CoDraft",
+        path="baselines/xgboost-tfidf_codraft"
     ),
     3: dict(
         name="ce_deberta_plain",
         family="cross",
         model=DEBERTA,
         variant="plain",
-        table="Table 2",
-        row="Cross-Encoder deberta (vanilla); also Fig. 4A",
-        path="baselines/cross-encoder_deberta-v3-base_plain",
+        table="Table 3",
+        row="Cross-Encoder DeBERTa-v3-base, vanilla",
+        path="baselines/cross-encoder_deberta-v3-base_plain"
     ),
     4: dict(
         name="ce_deberta_codraft",
         family="cross",
         model=DEBERTA,
         variant="codraft",
-        table="Table 2",
-        row="Cross-Encoder deberta (w/ CoDraft)",
-        path="baselines/cross-encoder_deberta-v3-base_codraft",
+        table="Table 3",
+        row="Cross-Encoder DeBERTa-v3-base, CoDraft",
+        path="baselines/cross-encoder_deberta-v3-base_codraft"
     ),
     5: dict(
         name="ce_bge_codraft",
         family="cross",
         model=BGE_RERANKER,
         variant="codraft",
-        table="Table 2",
-        row="Cross-Encoder, same backbone as ours (Reviewer 2)",
-        path="baselines/cross-encoder_bge-reranker-v2-m3_codraft",
+        table="Table 3",
+        row="Cross-Encoder BGE-Reranker-v2-M3 (our backbone), CoDraft",
+        path="baselines/cross-encoder_bge-reranker-v2-m3_codraft"
     ),
     6: dict(
         name="ce_bge_plain",
         family="cross",
         model=BGE_RERANKER,
         variant="plain",
-        table="Table 2",
-        row="Cross-Encoder, same backbone as ours (vanilla)",
-        path="baselines/cross-encoder_bge-reranker-v2-m3_plain",
+        table="Table 3",
+        row="Cross-Encoder BGE-Reranker-v2-M3 (our backbone), vanilla",
+        path="baselines/cross-encoder_bge-reranker-v2-m3_plain"
     ),
     7: dict(
         name="multi_codraft",
         family="multi",
         model=BGE_RERANKER,
         variant="codraft",
-        table="Table 2/3",
-        row="Multi-Task Cross-Encoder, full model; also Fig. 3 and 4B",
-        path="codraft",
+        table="Table 3/4",
+        row="Multi-Task Cross-Encoder, full model; also Figure 2",
+        path="codraft"
     ),
     8: dict(
         name="bi_bgem3_plain",
         family="bi",
         model=BGE_M3,
         variant="plain",
-        table="Table 2",
-        row="Bi-encoder / dense retriever (vanilla)",
-        path="baselines/bi-encoder_bge-m3_plain",
+        table="Table 3",
+        row="Bi-Encoder BGE-M3, vanilla",
+        path="baselines/bi-encoder_bge-m3_plain"
     ),
     9: dict(
         name="bi_bgem3_codraft",
         family="bi",
         model=BGE_M3,
         variant="codraft",
-        table="Table 2",
-        row="Bi-encoder / dense retriever (w/ CoDraft)",
-        path="baselines/bi-encoder_bge-m3_codraft",
+        table="Table 3",
+        row="Bi-Encoder BGE-M3, CoDraft",
+        path="baselines/bi-encoder_bge-m3_codraft"
     ),
     10: dict(
         name="ce_legalbert_plain",
         family="cross",
         model=LEGAL_BERT,
         variant="plain",
-        table="Table 2",
-        row="Cross-Encoder legal-BERT (vanilla)",
-        path="baselines/cross-encoder_legal-bert_plain",
+        table="Table 3",
+        row="Cross-Encoder LEGAL-BERT-base, vanilla",
+        path="baselines/cross-encoder_legal-bert_plain"
     ),
     11: dict(
         name="ce_legalbert_codraft",
         family="cross",
         model=LEGAL_BERT,
         variant="codraft",
-        table="Table 2",
-        row="Cross-Encoder legal-BERT (w/ CoDraft)",
-        path="baselines/cross-encoder_legal-bert_codraft",
+        table="Table 3",
+        row="Cross-Encoder LEGAL-BERT-base, CoDraft",
+        path="baselines/cross-encoder_legal-bert_codraft"
     ),
     12: dict(
         name="multi_plain",
         family="multi",
         model=BGE_RERANKER,
         variant="plain",
-        table="Table 3",
+        table="Table 4",
         row="w/o CoDraft Enrichment",
-        path="ablations/no-codraft-enrichment",
+        path="ablations/no-codraft-enrichment"
     ),
     13: dict(
         name="multi_category",
         family="multi",
         model=BGE_RERANKER,
         variant="category",
-        table="Table 3",
-        row="Term + NICE heading only (is the gain the free lookup?)",
-        path="ablations/no-llm-attributes",
+        table="Table 4",
+        row="w/o Nature & Purpose (class heading kept)",
+        path="ablations/no-llm-attributes"
     ),
     14: dict(
         name="multi_expanded",
         family="multi",
         model=BGE_RERANKER,
         variant="expanded",
-        table="Table 3",
-        row="free-text rewrite instead of Nature/Purpose (is the schema needed?)",
-        path="ablations/free-text-expansion",
+        table="Table 4",
+        row="w/ Free-text Expansion",
+        path="ablations/free-text-expansion"
     ),
     15: dict(
         name="multi_codraft_noaux",
@@ -136,9 +136,9 @@ RUNS = {
         model=BGE_RERANKER,
         variant="codraft",
         aux_weight=0.0,
-        table="Table 3",
+        table="Table 4",
         row="w/o Multi-Task Head",
-        path="ablations/no-multitask-head",
+        path="ablations/no-multitask-head"
     ),
     16: dict(
         name="multi_codraft_ce",
@@ -146,9 +146,9 @@ RUNS = {
         model=BGE_RERANKER,
         variant="codraft",
         loss_type="ce",
-        table="Table 3",
-        row="w/o Rank-Aware Loss (class-weighted CE)",
-        path="ablations/no-rank-aware-loss",
+        table="Table 4",
+        row="w/o Rank-Aware Loss (class-weighted cross-entropy)",
+        path="ablations/no-rank-aware-loss"
     ),
     17: dict(
         name="multi_codraft_alpha0",
@@ -156,9 +156,9 @@ RUNS = {
         model=BGE_RERANKER,
         variant="codraft",
         alpha=0.0,
-        table="Table 3",
-        row="focal loss only, no rank penalty",
-        path="ablations/no-rank-penalty",
+        table="Table 4",
+        row="w/o Rank Penalty (alpha = 0)",
+        path="ablations/no-rank-penalty"
     ),
     18: dict(
         name="multi_codraft_noaux_ce",
@@ -167,9 +167,9 @@ RUNS = {
         variant="codraft",
         aux_weight=0.0,
         loss_type="ce",
-        table="Table 3",
-        row="neither head nor rank-aware loss: the multi-task recipe alone",
-        path="ablations/no-head-no-rank-aware-loss",
+        table="Table 4",
+        row="w/o Head & Rank-Aware Loss",
+        path="ablations/no-head-no-rank-aware-loss"
     ),
     19: dict(
         name="probe_run07_inputs",
@@ -177,54 +177,54 @@ RUNS = {
         model=BGE_RERANKER,
         variant="codraft",
         source=7,
-        table="Analysis",
-        row="run 7 at test time with Nature / Purpose / heading removed or shuffled",
-        path="ablations/input-probe",
+        table="Table 4",
+        row="test-time input probe of the full model",
+        path="ablations/input-probe"
     ),
     20: dict(
         name="hybrid_mlp_bgem3_plain",
         family="hybrid",
         model=BGE_M3,
         variant="plain",
-        table="Table 2",
-        row="Hybrid MLP (P1): embeddings + one-hot NICE classes",
-        path="baselines/hybrid-mlp_bge-m3_plain",
+        table="Table 3",
+        row="Hybrid MLP of Le Nir et al. (2026), vanilla",
+        path="baselines/hybrid-mlp_bge-m3_plain"
     ),
     21: dict(
         name="multi_codraft_qwen2.5-7b",
         family="multi",
         model=BGE_RERANKER,
         variant="codraft_qwen2.5-7b",
-        table="Robustness",
-        row="Multi-Task Cross-Encoder, CoDraft by Qwen2.5-7B",
-        path="enrichment-llms/qwen2.5-7b",
+        table="Table 5",
+        row="full model on attributes from Qwen2.5-7B-Instruct",
+        path="enrichment-llms/qwen2.5-7b"
     ),
     22: dict(
         name="multi_codraft_qwen3-8b",
         family="multi",
         model=BGE_RERANKER,
         variant="codraft_qwen3-8b",
-        table="Robustness",
-        row="Multi-Task Cross-Encoder, CoDraft by Qwen3-8B",
-        path="enrichment-llms/qwen3-8b",
+        table="Table 5",
+        row="full model on attributes from Qwen3-8B",
+        path="enrichment-llms/qwen3-8b"
     ),
     23: dict(
         name="multi_codraft_llama3.1-8b",
         family="multi",
         model=BGE_RERANKER,
         variant="codraft_llama3.1-8b",
-        table="Robustness",
-        row="Multi-Task Cross-Encoder, CoDraft by Llama-3.1-8B",
-        path="enrichment-llms/llama3.1-8b",
+        table="Table 5",
+        row="full model on attributes from Llama-3.1-8B-Instruct",
+        path="enrichment-llms/llama3.1-8b"
     ),
     24: dict(
         name="multi_codraft_nemotron-nano-8b",
         family="multi",
         model=BGE_RERANKER,
         variant="codraft_nemotron-nano-8b",
-        table="Robustness",
-        row="Multi-Task Cross-Encoder, CoDraft by Nemotron-Nano-8B",
-        path="enrichment-llms/nemotron-nano-8b",
+        table="Table 5",
+        row="full model on attributes from Nemotron-Nano-8B",
+        path="enrichment-llms/nemotron-nano-8b"
     ),
     25: dict(
         name="multi_codraft_binary",
@@ -232,10 +232,10 @@ RUNS = {
         model=BGE_RERANKER,
         variant="codraft",
         binary=True,
-        table="Le Nir",
-        row="Multi-Task Cross-Encoder w/ CoDraft, trained on the binary target",
-        path="binary/codraft_binary-trained",
-    ),
+        table="Table 7",
+        row="full model trained on the binary target",
+        path="binary/codraft_binary-trained"
+    )
 }
 
 
@@ -246,11 +246,11 @@ def get_run(run_id: int) -> dict:
 
 
 def describe() -> str:
-    lines = [f"{'ID':>3}  {'name':24s} {'family':8s} {'variant':9s} {'table':10s} row"]
+    cols = ("name", "family", "variant", "table")
+    width = {c: max(len(c), *(len(r[c]) for r in RUNS.values())) for c in cols}
+    lines = [f"{'ID':>3}  " + " ".join(f"{c:{width[c]}s}" for c in cols) + " row"]
     for run_id in sorted(RUNS):
         run = RUNS[run_id]
-        lines.append(
-            f"{run_id:>3}  {run['name']:24s} {run['family']:8s} {run['variant']:9s} "
-            f"{run['table']:10s} {run['row']}"
-        )
+        cells = " ".join(f"{run[c]:{width[c]}s}" for c in cols)
+        lines.append(f"{run_id:>3}  {cells} {run['row']}")
     return "\n".join(lines)

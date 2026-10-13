@@ -10,16 +10,16 @@ def _given(value: object) -> bool:
 
 
 def create_structured_text_enhanced(
-    term: str, nature: object, purpose: object, class_id: int
+    term: str, nature: object, purpose: object, class_id: int, heading: bool = True
 ) -> str:
     parts = []
     if _given(nature):
         parts.append(f"Nature: {str(nature).strip()}")
     if _given(purpose):
         parts.append(f"Use: {str(purpose).strip()}")
-    heading = CONFIG_DATA.NICE_CLASS_MAP.get(int(class_id), "")
-    if heading:
-        parts.append(f"Category: {heading}")
+    category = CONFIG_DATA.NICE_CLASS_MAP.get(int(class_id), "") if heading else ""
+    if category:
+        parts.append(f"Category: {category}")
     text = str(term).strip()
     return f"{text} [ {' | '.join(parts)} ]" if parts else text
 
@@ -38,7 +38,7 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
                     df[f"Term {side}"],
                     df[f"Nature {side}"],
                     df[f"Purpose {side}"],
-                    df[f"Class {side}"],
+                    df[f"Class {side}"]
                 )
             ]
         else:

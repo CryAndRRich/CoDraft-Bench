@@ -9,11 +9,16 @@ from preprocess.data_loader import (
     create_ml_data,
     create_patterns,
     create_siamese_dataloader,
-    to_dataset,
+    to_dataset
 )
 from preprocess.preprocess_data import preprocess
 
 PIPELINES = {"ml", "multi_task", "cross_encoder", "siamese"}
+
+
+def class_maps() -> tuple[dict, dict]:
+    nice = sorted(CONFIG_DATA.NICE_CLASS_MAP)
+    return {c: f"[CLASS_{c}]" for c in nice}, {c: i for i, c in enumerate(nice)}
 
 
 class DataManager:
@@ -23,7 +28,7 @@ class DataManager:
         variant: str,
         build_for: str,
         tokenizer: PreTrainedTokenizer | None = None,
-        binary: bool = False,
+        binary: bool = False
     ) -> None:
         if build_for not in PIPELINES:
             raise ValueError(f"Unknown build_for {build_for!r}. Use one of {sorted(PIPELINES)}.")
@@ -40,13 +45,11 @@ class DataManager:
         classes = set()
         for d in splits:
             classes |= set(d["Class 1"]) | set(d["Class 2"])
-        nice = sorted(CONFIG_DATA.NICE_CLASS_MAP)
-        unknown = sorted(classes - set(nice))
+        unknown = sorted(classes - set(CONFIG_DATA.NICE_CLASS_MAP))
         if unknown:
             raise ValueError(f"Classes outside the NICE map: {unknown}")
-        self.class_to_token = {c: f"[CLASS_{c}]" for c in nice}
-        self.class_to_id = {c: i for i, c in enumerate(nice)}
-        self.NUM_PRODUCT_CLASSES = len(nice)
+        self.class_to_token, self.class_to_id = class_maps()
+        self.NUM_PRODUCT_CLASSES = len(self.class_to_id)
         self.df_train, self.df_val, self.df_test = (preprocess(d) for d in splits)
         if binary:
             for d in (self.df_train, self.df_val, self.df_test):

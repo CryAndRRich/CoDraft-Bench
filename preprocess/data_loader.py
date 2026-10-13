@@ -32,7 +32,7 @@ class PairSiameseDataset(TorchDataset):
             padding="max_length",
             truncation=True,
             max_length=self.max_len,
-            return_tensors="pt",
+            return_tensors="pt"
         )
 
     def __getitem__(self, idx: int) -> dict:
@@ -42,7 +42,7 @@ class PairSiameseDataset(TorchDataset):
             "mask1": enc1["attention_mask"].squeeze(0),
             "ids2": enc2["input_ids"].squeeze(0),
             "mask2": enc2["attention_mask"].squeeze(0),
-            "label": torch.tensor(self.labels[idx], dtype=torch.long),
+            "label": torch.tensor(self.labels[idx], dtype=torch.long)
         }
 
 
@@ -56,10 +56,7 @@ def collate_siamese(batch: list[dict]) -> dict:
 
 
 def create_ml_data(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    max_features: int = 5000,
+    train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame, max_features: int = 5000
 ) -> tuple:
     vectorizer = TfidfVectorizer(max_features=max_features, lowercase=True)
     vectorizer.fit(train_df["input_text_1"].tolist() + train_df["input_text_2"].tolist())
@@ -75,34 +72,29 @@ def create_ml_data(
 
 
 def create_siamese_dataloader(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    tokenizer: PreTrainedTokenizer,
+    train_df: pd.DataFrame, val_df: pd.DataFrame, tokenizer: PreTrainedTokenizer
 ) -> tuple[DataLoader, DataLoader]:
     cfg = CONFIG_MODEL.MODEL_CONFIG["siamese"]
     train_loader = DataLoader(
         PairSiameseDataset(train_df, tokenizer, CONFIG_DATA.MAX_LEN),
-        batch_size=cfg["physical_batch_size"],
+        batch_size=cfg["batch_size"],
         shuffle=True,
         num_workers=cfg["num_workers"],
         drop_last=True,
-        collate_fn=collate_siamese,
+        collate_fn=collate_siamese
     )
     val_loader = DataLoader(
         PairSiameseDataset(val_df, tokenizer, CONFIG_DATA.MAX_LEN),
-        batch_size=cfg["physical_batch_size"],
+        batch_size=cfg["batch_size"],
         shuffle=False,
-        num_workers=2,
-        collate_fn=collate_siamese,
+        num_workers=cfg["num_workers"],
+        collate_fn=collate_siamese
     )
     return train_loader, val_loader
 
 
 def create_patterns(
-    df: pd.DataFrame,
-    tokenizer: PreTrainedTokenizer,
-    class_to_token: dict,
-    class_to_id: dict,
+    df: pd.DataFrame, tokenizer: PreTrainedTokenizer, class_to_token: dict, class_to_id: dict
 ) -> pd.DataFrame:
     mask = tokenizer.mask_token
     rows = []
@@ -114,7 +106,7 @@ def create_patterns(
                 "text1": f"{mask} {t1}",
                 "text2": f"{class_to_token.get(c2, '')} {t2}",
                 "labels": label,
-                "aux_labels": class_to_id.get(c1, 0),
+                "aux_labels": class_to_id.get(c1, 0)
             }
         )
         rows.append(
@@ -122,7 +114,7 @@ def create_patterns(
                 "text1": f"{class_to_token.get(c1, '')} {t1}",
                 "text2": f"{mask} {t2}",
                 "labels": label,
-                "aux_labels": class_to_id.get(c2, 0),
+                "aux_labels": class_to_id.get(c2, 0)
             }
         )
     return pd.DataFrame(rows)
@@ -134,7 +126,7 @@ def preprocess_dataset(examples: dict, tokenizer: PreTrainedTokenizer) -> dict:
         examples["text2"],
         truncation=True,
         max_length=CONFIG_DATA.MAX_LEN,
-        padding=False,
+        padding=False
     )
     tokenized["labels"] = examples["labels"]
     tokenized["aux_labels"] = examples["aux_labels"]
@@ -142,8 +134,7 @@ def preprocess_dataset(examples: dict, tokenizer: PreTrainedTokenizer) -> dict:
 
 
 def create_dataloader_cross_encoder(
-    df_train: pd.DataFrame,
-    df_val: pd.DataFrame,
+    df_train: pd.DataFrame, df_val: pd.DataFrame
 ) -> tuple[DataLoader, CESoftmaxAccuracyEvaluator]:
     def examples(df: pd.DataFrame) -> list[InputExample]:
         return [
@@ -151,7 +142,11 @@ def create_dataloader_cross_encoder(
             for a, b, y in zip(df["input_text_1"], df["input_text_2"], df["label_score"])
         ]
 
-    train_dataloader = DataLoader(examples(df_train), shuffle=True, batch_size=32)
+    train_dataloader = DataLoader(
+        examples(df_train),
+        shuffle=True,
+        batch_size=CONFIG_MODEL.MODEL_CONFIG["cross_encoder"]["batch_size"]
+    )
     evaluator = CESoftmaxAccuracyEvaluator.from_input_examples(
         examples(df_val), name="Ordinal_Check"
     )
@@ -163,7 +158,7 @@ def to_dataset(df_aug: pd.DataFrame, tokenizer: PreTrainedTokenizer) -> Dataset:
         preprocess_dataset,
         batched=True,
         fn_kwargs={"tokenizer": tokenizer},
-        remove_columns=df_aug.columns.tolist(),
+        remove_columns=df_aug.columns.tolist()
     )
     ds.set_format(type="torch", columns=["input_ids", "attention_mask", "labels", "aux_labels"])
     return ds

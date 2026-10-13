@@ -22,7 +22,7 @@ def train_xgboost(
     y_train: np.ndarray,
     X_val: sp.spmatrix,
     y_val: np.ndarray,
-    class_weights: np.ndarray,
+    class_weights: np.ndarray
 ) -> xgb.XGBClassifier:
     model = get_model_xgboost()
     model.fit(
@@ -30,7 +30,7 @@ def train_xgboost(
         y_train,
         sample_weight=get_xgboost_sample_weights(y_train, class_weights),
         eval_set=[(X_train, y_train), (X_val, y_val)],
-        **CONFIG_MODEL.MODEL_CONFIG["xgboost"]["train_args"],
+        **CONFIG_MODEL.MODEL_CONFIG["xgboost"]["train_args"]
     )
     return model
 
@@ -42,7 +42,7 @@ def train_bi_encoder_baseline(
     class_weights: np.ndarray,
     output_path: str,
     device: torch.device,
-    epochs: int,
+    epochs: int
 ) -> None:
     model = get_model_bi_encoder_baseline(input_model_path, num_classes=CONFIG_MODEL.NUM_CLASSES)
     model.to(device)
@@ -65,7 +65,7 @@ def train_bi_encoder_baseline(
                 batch["ids1"].to(device),
                 batch["mask1"].to(device),
                 batch["ids2"].to(device),
-                batch["mask2"].to(device),
+                batch["mask2"].to(device)
             )
             loss = criterion(logits, batch["label"].to(device))
             loss.backward()
@@ -81,7 +81,7 @@ def train_bi_encoder_baseline(
                     batch["ids1"].to(device),
                     batch["mask1"].to(device),
                     batch["ids2"].to(device),
-                    batch["mask2"].to(device),
+                    batch["mask2"].to(device)
                 )
                 val_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
                 val_labels.extend(batch["label"].numpy())
@@ -104,7 +104,7 @@ def train_cross_encoder(
     train_dataloader: DataLoader,
     evaluator: CESoftmaxAccuracyEvaluator,
     output_path: str,
-    epochs: int,
+    epochs: int
 ) -> CrossEncoder:
     model.model.gradient_checkpointing_enable()
     model.fit(
@@ -118,7 +118,7 @@ def train_cross_encoder(
         warmup_steps=int(len(train_dataloader) * 0.1),
         output_path=output_path,
         show_progress_bar=True,
-        evaluation_steps=CONFIG_MODEL.MODEL_CONFIG["cross_encoder"]["evaluation_steps"],
+        evaluation_steps=CONFIG_MODEL.MODEL_CONFIG["cross_encoder"]["evaluation_steps"]
     )
     if not os.path.isfile(os.path.join(output_path, "config.json")):
         print("No checkpoint was saved; predicting with the last epoch.")

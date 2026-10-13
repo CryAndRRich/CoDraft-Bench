@@ -29,7 +29,7 @@ def stats(y_true: list | np.ndarray, y_pred: list | np.ndarray, num_classes: int
                 "precision": precision,
                 "recall": recall,
                 "f1": _div(2 * precision * recall, precision + recall),
-                "name": names[c],
+                "name": names[c]
             }
         )
     err = np.abs(y_true - y_pred)
@@ -44,15 +44,12 @@ def stats(y_true: list | np.ndarray, y_pred: list | np.ndarray, num_classes: int
         "adjacent_acc": float((err <= 1).mean()),
         "severe_rate": float((err >= 2).mean()),
         "per_class": per_class,
-        "confusion_matrix": cm.tolist(),
+        "confusion_matrix": cm.tolist()
     }
 
 
 def binary_metrics(
-    true: list | np.ndarray,
-    pred: list | np.ndarray,
-    n_balanced: int = 30,
-    seed: int = 0,
+    true: list | np.ndarray, pred: list | np.ndarray, n_balanced: int = 30, seed: int = 0
 ) -> dict:
     y = (np.asarray(true) >= 1).astype(int)
     p = (np.asarray(pred) >= 1).astype(int)
@@ -66,7 +63,7 @@ def binary_metrics(
             "f1": 2 * prec * rec / max(prec + rec, 1e-12),
             "recall": rec,
             "specificity": spec,
-            "precision": prec,
+            "precision": prec
         }
 
     pos, neg = np.where(y == 1)[0], np.where(y == 0)[0]

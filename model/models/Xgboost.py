@@ -10,9 +10,9 @@ def get_model_xgboost() -> xgb.XGBClassifier:
         num_class=CONFIG_MODEL.NUM_CLASSES,
         device=CONFIG_MODEL.DEVICE,
         tree_method="hist",
-        **CONFIG_MODEL.MODEL_CONFIG["xgboost"]["model_args"],
+        **CONFIG_MODEL.MODEL_CONFIG["xgboost"]["model_args"]
     )
 
 
 def get_xgboost_sample_weights(y_train: np.ndarray, class_weights: np.ndarray) -> np.ndarray:
-    return np.array([class_weights[int(label)] for label in y_train])
+    return np.asarray(class_weights)[np.asarray(y_train, dtype=int)]

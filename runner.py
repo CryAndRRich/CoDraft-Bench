@@ -21,7 +21,7 @@ RESULT_FILES = {
     "_preds.csv": "preds.csv",
     "_metrics.json": "metrics.json",
     "_logits.npy": "logits.npy",
-    "_raw.jsonl": "raw.jsonl",
+    "_raw.jsonl": "raw.jsonl"
 }
 PRINT_LOCK = threading.Lock()
 
@@ -148,7 +148,7 @@ def _environment() -> dict:
         "torch": torch.__version__,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-        "n_gpu_visible": torch.cuda.device_count(),
+        "n_gpu_visible": torch.cuda.device_count()
     }
     for pkg in ("transformers", "sentence_transformers", "xgboost", "sklearn", "datasets"):
         try:
@@ -166,7 +166,7 @@ def _data_manager(ctx: dict, tokenizer: object, build_for: str) -> object:
         variant=ctx["spec"]["variant"],
         build_for=build_for,
         tokenizer=tokenizer,
-        binary=ctx["spec"].get("binary", False),
+        binary=ctx["spec"].get("binary", False)
     )
     for split, d in zip(("train", "val", "test"), dm.get_data()):
         for c in ("input_text_1", "input_text_2"):
@@ -210,13 +210,13 @@ def _run_cross(ctx: dict) -> tuple:
     weights = torch.tensor(
         compute_class_weight(df_train["label_score"].values),
         dtype=torch.float32,
-        device=ctx["device"],
+        device=ctx["device"]
     )
     model = get_model_cross_encoder(
         ctx["spec"]["model"],
-        num_classes=5,
+        num_classes=CONFIG_MODEL.NUM_CLASSES,
         max_len=CONFIG_DATA.MAX_LEN,
-        weights_tensor=weights,
+        weights_tensor=weights
     )
     epochs = 1 if ctx["smoke"] else CONFIG_MODEL.MODEL_CONFIG["cross_encoder"]["epochs"]
     model = train_cross_encoder(
@@ -226,8 +226,8 @@ def _run_cross(ctx: dict) -> tuple:
     extra = {
         "epochs": epochs,
         "class_weights": weights.tolist(),
-        "batch_size": 32,
-        "best_val_accuracy": float(getattr(model, "best_score", float("nan"))),
+        "batch_size": CONFIG_MODEL.MODEL_CONFIG["cross_encoder"]["batch_size"],
+        "best_val_accuracy": float(getattr(model, "best_score", float("nan")))
     }
     return preds, true, df_test, None, extra, None
 
@@ -254,9 +254,14 @@ def _run_bi(ctx: dict) -> tuple:
     extra = {
         "epochs": epochs,
         "class_weights": list(map(float, cw)),
-        "batch_size": CONFIG_MODEL.MODEL_CONFIG["siamese"]["physical_batch_size"],
+        "batch_size": CONFIG_MODEL.MODEL_CONFIG["siamese"]["batch_size"]
     }
     return preds, true, df_test, None, extra, None
+
+
+def _check_class_tokens(tokenizer: object, tokens: list[str]) -> None:
+    bad = [t for t in tokens if len(tokenizer.encode(t, add_special_tokens=False)) != 1]
+    assert not bad, f"Class tokens split into subwords: {bad[:5]}"
 
 
 def _trainer_tokenizer_kw() -> str:
@@ -283,12 +288,7 @@ def _run_multi(ctx: dict) -> tuple:
     spec = ctx["spec"]
     tokenizer = get_tokenizer(spec["model"], add_class_tokens=True)
     dm = _data_manager(ctx, tokenizer, "multi_task")
-    bad = [
-        t
-        for t in dm.class_to_token.values()
-        if len(tokenizer.encode(t, add_special_tokens=False)) != 1
-    ]
-    assert not bad, f"Class markers split into subwords: {bad[:5]}"
+    _check_class_tokens(tokenizer, list(dm.class_to_token.values()))
     train_ds, val_ds, test_ds = dm.datasets
     df_train, _, df_test = dm.get_data()
     assert len(test_ds) == 2 * len(df_test), "create_patterns must give two rows per pair"
@@ -312,7 +312,7 @@ def _run_multi(ctx: dict) -> tuple:
         device=ctx["device"],
         class_weights=class_weights,
         tokenizer=tokenizer,
-        **loss,
+        **loss
     )
     assert model.get_input_embeddings().num_embeddings >= len(tokenizer)
     trainer = Trainer(
@@ -322,7 +322,7 @@ def _run_multi(ctx: dict) -> tuple:
         eval_dataset=val_ds,
         data_collator=DataCollatorWithPadding(tokenizer),
         compute_metrics=compute_metrics,
-        **{_trainer_tokenizer_kw(): tokenizer},
+        **{_trainer_tokenizer_kw(): tokenizer}
     )
     trainer.train()
     preds, true, logits = get_preds_multi(trainer, test_ds, df_test)
@@ -344,7 +344,7 @@ def _run_multi(ctx: dict) -> tuple:
         "fp16": args.fp16,
         "best_checkpoint": trainer.state.best_model_checkpoint,
         "best_val_f1_macro": trainer.state.best_metric,
-        "vocab_size": len(tokenizer),
+        "vocab_size": len(tokenizer)
     }
     return preds, true, df_test, save, extra, logits
 
@@ -355,10 +355,10 @@ def _run_probe(ctx: dict) -> tuple:
     import torch
     from transformers import AutoTokenizer, DataCollatorWithPadding, Trainer, TrainingArguments
 
-    from config.config_data import CONFIG_DATA
     from model.models.MultiTask import JointClassSimBGE
     from preprocess.data_loader import create_patterns, to_dataset
-    from preprocess.preprocess_data import preprocess
+    from preprocess.data_manager import class_maps
+    from preprocess.preprocess_data import create_structured_text_enhanced, preprocess
     from utils.evaluate import build_result_df, get_preds_multi
     from utils.metrics import stats
 
@@ -367,34 +367,19 @@ def _run_probe(ctx: dict) -> tuple:
     print("Checkpoint:", ckpt)
     tokenizer = AutoTokenizer.from_pretrained(ckpt, use_fast=False)
     model = JointClassSimBGE.from_pretrained(ckpt).to(ctx["device"]).eval()
-    nice = sorted(CONFIG_DATA.NICE_CLASS_MAP)
-    class_to_token = {c: f"[CLASS_{c}]" for c in nice}
-    class_to_id = {c: i for i, c in enumerate(nice)}
-    bad = [
-        t
-        for t in class_to_token.values()
-        if len(tokenizer.encode(t, add_special_tokens=False)) != 1
-    ]
-    assert not bad, f"Checkpoint tokenizer lacks the class tokens: {bad[:5]}"
+    class_to_token, class_to_id = class_maps()
+    _check_class_tokens(tokenizer, list(class_to_token.values()))
 
     raw = pd.read_csv(os.path.join(ctx["data_root"], spec["variant"], "test.csv"), low_memory=False)
     base = preprocess(raw.copy())
 
-    def build(term: str, nature: str, purpose: str, cls: int, use_c: bool = True) -> str:
-        parts = []
-        if str(nature).strip():
-            parts.append(f"Nature: {str(nature).strip()}")
-        if str(purpose).strip():
-            parts.append(f"Use: {str(purpose).strip()}")
-        if use_c and CONFIG_DATA.NICE_CLASS_MAP.get(int(cls), ""):
-            parts.append(f"Category: {CONFIG_DATA.NICE_CLASS_MAP[int(cls)]}")
-        text = str(term).strip()
-        return f"{text} [ {' | '.join(parts)} ]" if parts else text
-
-    def frame(n1: list, p1: list, n2: list, p2: list, use_c: bool = True) -> pd.DataFrame:
+    def frame(n1: list, p1: list, n2: list, p2: list, heading: bool = True) -> pd.DataFrame:
         d = base.copy()
-        d["input_text_1"] = [build(*x, use_c=use_c) for x in zip(d["Term 1"], n1, p1, d["Class 1"])]
-        d["input_text_2"] = [build(*x, use_c=use_c) for x in zip(d["Term 2"], n2, p2, d["Class 2"])]
+        for side, n, p in (("1", n1, p1), ("2", n2, p2)):
+            d[f"input_text_{side}"] = [
+                create_structured_text_enhanced(t, a, b, c, heading=heading)
+                for t, a, b, c in zip(d[f"Term {side}"], n, p, d[f"Class {side}"])
+            ]
         return d
 
     N1, P1, N2, P2 = (
@@ -402,12 +387,6 @@ def _run_probe(ctx: dict) -> tuple:
         for c in ("Nature 1", "Purpose 1", "Nature 2", "Purpose 2")
     )
     full = frame(N1, P1, N2, P2)
-    assert (full["input_text_1"] == base["input_text_1"]).all(), (
-        "Probe input builder drifted from preprocess()"
-    )
-    assert (full["input_text_2"] == base["input_text_2"]).all(), (
-        "Probe input builder drifted from preprocess()"
-    )
     rng = np.random.default_rng(SEED)
     pool = np.array(list(zip(np.r_[N1, N2], np.r_[P1, P2])), dtype=object)
     perm = pool[rng.permutation(len(pool))]
@@ -418,9 +397,9 @@ def _run_probe(ctx: dict) -> tuple:
         "no_nature": frame(empty, P1, empty, P2),
         "no_purpose": frame(N1, empty, N2, empty),
         "heading_only": frame(empty, empty, empty, empty),
-        "no_heading": frame(N1, P1, N2, P2, use_c=False),
-        "bare_term": frame(empty, empty, empty, empty, use_c=False),
-        "shuffled_attributes": frame(perm[:n, 0], perm[:n, 1], perm[n:, 0], perm[n:, 1]),
+        "no_heading": frame(N1, P1, N2, P2, heading=False),
+        "bare_term": frame(empty, empty, empty, empty, heading=False),
+        "shuffled_attributes": frame(perm[:n, 0], perm[:n, 1], perm[n:, 0], perm[n:, 1])
     }
 
     args = TrainingArguments(
@@ -429,13 +408,13 @@ def _run_probe(ctx: dict) -> tuple:
         report_to="none",
         fp16=torch.cuda.is_available(),
         remove_unused_columns=False,
-        dataloader_num_workers=2,
+        dataloader_num_workers=2
     )
     trainer = Trainer(
         model=model,
         args=args,
         data_collator=DataCollatorWithPadding(tokenizer),
-        **{_trainer_tokenizer_kw(): tokenizer},
+        **{_trainer_tokenizer_kw(): tokenizer}
     )
     results = {}
     for name, d in conditions.items():
@@ -453,7 +432,7 @@ def _run_probe(ctx: dict) -> tuple:
             "adjacent_acc": m["adjacent_acc"],
             "severe_rate": m["severe_rate"],
             "per_class_f1": [r["f1"] for r in m["per_class"]],
-            "example_input": d["input_text_1"].iloc[0],
+            "example_input": d["input_text_1"].iloc[0]
         }
         print(
             f"[probe] {name:20s} Macro-F1 {m['f1_macro'] * 100:.2f} | QWK {m['qwk']:.4f} | MAE {m['mae']:.4f}"
@@ -496,7 +475,7 @@ def _run_hybrid(ctx: dict) -> tuple:
         batch_size=64,
         convert_to_numpy=True,
         normalize_embeddings=True,
-        show_progress_bar=True,
+        show_progress_bar=True
     )
     index = {t: i for i, t in enumerate(texts)}
     del encoder
@@ -524,7 +503,7 @@ def _run_hybrid(ctx: dict) -> tuple:
         nn.Linear(512, 256),
         nn.ReLU(),
         nn.Dropout(0.1),
-        nn.Linear(256, 5),
+        nn.Linear(256, 5)
     ).to(device)
     opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
     crit = nn.CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float32, device=device))
@@ -565,9 +544,9 @@ def _run_hybrid(ctx: dict) -> tuple:
                 "state_dict": best_state,
                 "encoder": encoder_name,
                 "in_dim": int(Xtr.shape[1]),
-                "features": "[u, v, |u-v|, u*v, onehot(class1), onehot(class2), same_class]",
+                "features": "[u, v, |u-v|, u*v, onehot(class1), onehot(class2), same_class]"
             },
-            os.path.join(ctx["weights_dir"], "hybrid_mlp.pt"),
+            os.path.join(ctx["weights_dir"], "hybrid_mlp.pt")
         )
 
     extra = {
@@ -577,7 +556,7 @@ def _run_hybrid(ctx: dict) -> tuple:
         "epochs_run": epoch,
         "best_val_f1_macro": float(best),
         "class_weights": list(map(float, cw)),
-        "unique_texts": len(texts),
+        "unique_texts": len(texts)
     }
     return predict(Xte), df_test["label_score"].values, df_test, save, extra, None
 
@@ -588,7 +567,7 @@ FAMILIES = {
     "bi": _run_bi,
     "multi": _run_multi,
     "probe": _run_probe,
-    "hybrid": _run_hybrid,
+    "hybrid": _run_hybrid
 }
 
 
@@ -634,7 +613,7 @@ def run_experiment(
         "scratch": scratch,
         "n_classes": n_classes,
         "generator": _setup_determinism(SEED),
-        "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        "device": torch.device("cuda" if torch.cuda.is_available() else "cpu")
     }
     env = _environment()
     print("Environment:", json.dumps(env))
@@ -670,7 +649,7 @@ def run_experiment(
         "confusion_matrix": m["confusion_matrix"],
         "train_seconds": round(time.time() - t0, 1),
         "environment": env,
-        "settings": extra,
+        "settings": extra
     }
     with open(os.path.join(results_dir, f"{tag}_metrics.json"), "w") as fh:
         json.dump(record, fh, indent=2, default=float)
@@ -765,7 +744,7 @@ def launch(
                 "--data-root",
                 data_root,
                 "--out-root",
-                out_root,
+                out_root
             ]
             if smoke:
                 cmd.append("--smoke")
@@ -776,7 +755,7 @@ def launch(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1,
+                bufsize=1
             )
             device = f"gpu{slot}" if n_gpu else "cpu"
             log_path = os.path.join(log_dir, f"{run_tag(run_id, smoke)}.log")
@@ -824,7 +803,7 @@ def package(tags: list[str], out_root: str = ".") -> str | None:
             zf.write(
                 f,
                 os.path.relpath(f, out_root),
-                compress_type=zipfile.ZIP_STORED if heavy else zipfile.ZIP_DEFLATED,
+                compress_type=zipfile.ZIP_STORED if heavy else zipfile.ZIP_DEFLATED
             )
     with zipfile.ZipFile(path) as zf:
         bad, n = zf.testzip(), len(zf.namelist())

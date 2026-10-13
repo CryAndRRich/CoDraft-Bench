@@ -11,10 +11,7 @@ class BasicBiEncoderClassifier(nn.Module):
         self.encoder = SentenceTransformer(base_model_path, trust_remote_code=True)
         dim = self.encoder.get_sentence_embedding_dimension()
         self.classifier = nn.Sequential(
-            nn.Linear(dim * 3, dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(dim, num_classes),
+            nn.Linear(dim * 3, dim), nn.ReLU(), nn.Dropout(0.1), nn.Linear(dim, num_classes)
         )
 
     def forward(
@@ -22,7 +19,7 @@ class BasicBiEncoderClassifier(nn.Module):
         input_ids1: torch.Tensor,
         attention_mask1: torch.Tensor,
         input_ids2: torch.Tensor,
-        attention_mask2: torch.Tensor,
+        attention_mask2: torch.Tensor
     ) -> torch.Tensor:
         u = self.encoder({"input_ids": input_ids1, "attention_mask": attention_mask1})[
             "sentence_embedding"

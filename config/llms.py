@@ -9,7 +9,7 @@ DEFAULTS = dict(
     gpu_memory_utilization=0.90,
     batch_size=10,
     workers=16,
-    rescue_penalty=1.15,
+    rescue_penalty=1.15
 )
 
 LLMS = {
@@ -17,8 +17,7 @@ LLMS = {
     "qwen3-8b": dict(model="Qwen/Qwen3-8B", chat_kwargs={"enable_thinking": False}),
     "llama3.1-8b": dict(model="meta-llama/Llama-3.1-8B-Instruct", gated=True),
     "nemotron-nano-8b": dict(
-        model="nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
-        system="detailed thinking off",
+        model="nvidia/Llama-3.1-Nemotron-Nano-8B-v1", system="detailed thinking off"
     ),
     "gemini-2.5-flash": dict(
         model="gemini-2.5-flash",
@@ -26,8 +25,8 @@ LLMS = {
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         api_key_env="GEMINI_API_KEY",
         batch_size=30,
-        workers=1,
-    ),
+        workers=1
+    )
 }
 
 
