@@ -235,6 +235,179 @@ RUNS = {
         table="Table 7",
         row="full model trained on the binary target",
         path="binary/codraft_binary-trained"
+    ),
+    26: dict(
+        name="ce_recipe_bge_plain",
+        family="ce_recipe",
+        model=BGE_RERANKER,
+        variant="plain",
+        table="Rebuttal E1",
+        row="Cross-Encoder bge-reranker-v2-m3, vanilla, trained with the full model's recipe (E1b: two orders averaged)",
+        path="rebuttal/ce-same-recipe/bge-reranker-v2-m3_plain",
+        rebuttal="E1"
+    ),
+    27: dict(
+        name="ce_recipe_bge_codraft",
+        family="ce_recipe",
+        model=BGE_RERANKER,
+        variant="codraft",
+        table="Rebuttal E1",
+        row="Cross-Encoder bge-reranker-v2-m3, CoDraft, trained with the full model's recipe (E1b: two orders averaged)",
+        path="rebuttal/ce-same-recipe/bge-reranker-v2-m3_codraft",
+        rebuttal="E1"
+    ),
+    28: dict(
+        name="ce_recipe_deberta_plain",
+        family="ce_recipe",
+        model=DEBERTA,
+        variant="plain",
+        table="Rebuttal E1",
+        row="Cross-Encoder deberta-v3-base, vanilla, trained with the full model's recipe (E1b: two orders averaged)",
+        path="rebuttal/ce-same-recipe/deberta-v3-base_plain",
+        rebuttal="E1"
+    ),
+    29: dict(
+        name="ce_recipe_deberta_codraft",
+        family="ce_recipe",
+        model=DEBERTA,
+        variant="codraft",
+        table="Rebuttal E1",
+        row="Cross-Encoder deberta-v3-base, CoDraft, trained with the full model's recipe (E1b: two orders averaged)",
+        path="rebuttal/ce-same-recipe/deberta-v3-base_codraft",
+        rebuttal="E1"
+    ),
+    30: dict(
+        name="multi_codraft",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft",
+        seed=13,
+        table="Rebuttal E2",
+        row="full model, seed 13",
+        path="rebuttal/seeds/codraft_seed13",
+        rebuttal="E2"
+    ),
+    31: dict(
+        name="multi_codraft",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft",
+        seed=2026,
+        table="Rebuttal E2",
+        row="full model, seed 2026",
+        path="rebuttal/seeds/codraft_seed2026",
+        rebuttal="E2"
+    ),
+    32: dict(
+        name="multi_plain",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="plain",
+        seed=13,
+        table="Rebuttal E2",
+        row="w/o CoDraft Enrichment, seed 13",
+        path="rebuttal/seeds/no-codraft-enrichment_seed13",
+        rebuttal="E2"
+    ),
+    33: dict(
+        name="multi_plain",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="plain",
+        seed=2026,
+        table="Rebuttal E2",
+        row="w/o CoDraft Enrichment, seed 2026",
+        path="rebuttal/seeds/no-codraft-enrichment_seed2026",
+        rebuttal="E2"
+    ),
+    34: dict(
+        name="hybrid_mlp_bgem3_codraft",
+        family="hybrid",
+        model=BGE_M3,
+        variant="codraft",
+        table="Rebuttal E6",
+        row="Hybrid MLP of Le Nir et al. (2026), CoDraft input",
+        path="rebuttal/hybrid-mlp_bge-m3_codraft",
+        rebuttal="E6"
+    ),
+    35: dict(
+        name="multi_codraft_mask_nohead",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft",
+        mask_hides_heading=True,
+        table="Rebuttal E9b",
+        row="full model, masked side also loses its class heading",
+        path="rebuttal/mask-hides-heading",
+        rebuttal="E9b"
+    ),
+    36: dict(
+        name="multi_codraft_coral",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft",
+        loss_type="coral",
+        aux_weight=0.0,
+        table="Rebuttal E7",
+        row="CORAL ordinal head instead of the 5-way head and rank-aware loss, no masked class head (compare with run 18)",
+        path="rebuttal/ordinal-heads/coral",
+        rebuttal="E7"
+    ),
+    37: dict(
+        name="multi_codraft_corn",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft",
+        loss_type="corn",
+        aux_weight=0.0,
+        table="Rebuttal E7",
+        row="CORN ordinal head instead of the 5-way head and rank-aware loss, no masked class head (compare with run 18)",
+        path="rebuttal/ordinal-heads/corn",
+        rebuttal="E7"
+    ),
+    38: dict(
+        name="ce_recipe_bge_plain",
+        family="ce_recipe",
+        model=BGE_RERANKER,
+        variant="plain",
+        seed=13,
+        table="Rebuttal E2 (optional)",
+        row="run 26, seed 13",
+        path="rebuttal/seeds/ce-same-recipe_bge-reranker-v2-m3_plain_seed13",
+        rebuttal="E2"
+    ),
+    39: dict(
+        name="ce_recipe_bge_codraft",
+        family="ce_recipe",
+        model=BGE_RERANKER,
+        variant="codraft",
+        seed=13,
+        table="Rebuttal E2 (optional)",
+        row="run 27, seed 13",
+        path="rebuttal/seeds/ce-same-recipe_bge-reranker-v2-m3_codraft_seed13",
+        rebuttal="E2"
+    ),
+    40: dict(
+        name="ce_recipe_bge_plain",
+        family="ce_recipe",
+        model=BGE_RERANKER,
+        variant="plain",
+        seed=2026,
+        table="Rebuttal E2 (optional)",
+        row="run 26, seed 2026",
+        path="rebuttal/seeds/ce-same-recipe_bge-reranker-v2-m3_plain_seed2026",
+        rebuttal="E2"
+    ),
+    41: dict(
+        name="ce_recipe_bge_codraft",
+        family="ce_recipe",
+        model=BGE_RERANKER,
+        variant="codraft",
+        seed=2026,
+        table="Rebuttal E2 (optional)",
+        row="run 27, seed 2026",
+        path="rebuttal/seeds/ce-same-recipe_bge-reranker-v2-m3_codraft_seed2026",
+        rebuttal="E2"
     )
 }
 

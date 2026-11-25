@@ -94,16 +94,27 @@ def create_siamese_dataloader(
 
 
 def create_patterns(
-    df: pd.DataFrame, tokenizer: PreTrainedTokenizer, class_to_token: dict, class_to_id: dict
+    df: pd.DataFrame,
+    tokenizer: PreTrainedTokenizer,
+    class_to_token: dict,
+    class_to_id: dict,
+    hide_heading: bool = False
 ) -> pd.DataFrame:
     mask = tokenizer.mask_token
+    suffix = "_nohead" if hide_heading else ""
     rows = []
-    for c1, t1, c2, t2, label in zip(
-        df["Class 1"], df["input_text_1"], df["Class 2"], df["input_text_2"], df["label_score"]
+    for c1, t1, c2, t2, m1, m2, label in zip(
+        df["Class 1"],
+        df["input_text_1"],
+        df["Class 2"],
+        df["input_text_2"],
+        df[f"input_text_1{suffix}"],
+        df[f"input_text_2{suffix}"],
+        df["label_score"]
     ):
         rows.append(
             {
-                "text1": f"{mask} {t1}",
+                "text1": f"{mask} {m1}",
                 "text2": f"{class_to_token.get(c2, '')} {t2}",
                 "labels": label,
                 "aux_labels": class_to_id.get(c1, 0)
@@ -112,7 +123,7 @@ def create_patterns(
         rows.append(
             {
                 "text1": f"{class_to_token.get(c1, '')} {t1}",
-                "text2": f"{mask} {t2}",
+                "text2": f"{mask} {m2}",
                 "labels": label,
                 "aux_labels": class_to_id.get(c2, 0)
             }

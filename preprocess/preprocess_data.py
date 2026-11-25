@@ -24,6 +24,23 @@ def create_structured_text_enhanced(
     return f"{text} [ {' | '.join(parts)} ]" if parts else text
 
 
+def add_text_without_heading(df: pd.DataFrame) -> pd.DataFrame:
+    for side in ("1", "2"):
+        if f"Nature {side}" in df.columns and f"Term {side} Expand" not in df.columns:
+            df[f"input_text_{side}_nohead"] = [
+                create_structured_text_enhanced(t, n, p, c, heading=False)
+                for t, n, p, c in zip(
+                    df[f"Term {side}"],
+                    df[f"Nature {side}"],
+                    df[f"Purpose {side}"],
+                    df[f"Class {side}"]
+                )
+            ]
+        else:
+            df[f"input_text_{side}_nohead"] = df[f"input_text_{side}"]
+    return df
+
+
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df["label_score"] = df["Similarity"].map(LABEL_MAPPING)
     df = df.dropna(subset=["label_score"])

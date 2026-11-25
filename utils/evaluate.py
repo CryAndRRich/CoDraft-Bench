@@ -15,9 +15,9 @@ from preprocess.data_loader import PairSiameseDataset, collate_siamese
 
 
 def get_preds_multi(
-    trainer: Trainer, test_ds: object, df_test: pd.DataFrame
+    trainer: Trainer, test_ds: object, df_test: pd.DataFrame, output: object = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    predictions = trainer.predict(test_ds).predictions
+    predictions = (output if output is not None else trainer.predict(test_ds)).predictions
     if isinstance(predictions, tuple):
         predictions = predictions[0]
     if len(predictions) != 2 * len(df_test):
@@ -27,6 +27,13 @@ def get_preds_multi(
         )
     avg_logits = predictions.reshape(-1, 2, predictions.shape[-1]).mean(axis=1)
     return np.argmax(avg_logits, axis=-1), df_test["label_score"].values, avg_logits
+
+
+def aux_accuracy(output: object) -> float | None:
+    preds, labels = output.predictions, output.label_ids
+    if not (isinstance(preds, tuple) and isinstance(labels, tuple)) or len(preds) < 2:
+        return None
+    return float((np.argmax(preds[1], axis=-1) == np.asarray(labels[1])).mean())
 
 
 def build_result_df(

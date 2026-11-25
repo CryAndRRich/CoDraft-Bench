@@ -26,8 +26,12 @@ RESULT_FILES = {
 PRINT_LOCK = threading.Lock()
 
 
+def run_seed(run_id: int) -> int:
+    return int(RUNS[run_id].get("seed", SEED))
+
+
 def run_tag(run_id: int, smoke: bool = False) -> str:
-    return ("SMOKE_" if smoke else "") + f"{run_id:02d}_{RUNS[run_id]['name']}_seed{SEED}"
+    return ("SMOKE_" if smoke else "") + f"{run_id:02d}_{RUNS[run_id]['name']}_seed{run_seed(run_id)}"
 
 
 def _search_kaggle(ok: Callable[[str], bool]) -> str | None:
@@ -166,7 +170,8 @@ def _data_manager(ctx: dict, tokenizer: object, build_for: str) -> object:
         variant=ctx["spec"]["variant"],
         build_for=build_for,
         tokenizer=tokenizer,
-        binary=ctx["spec"].get("binary", False)
+        binary=ctx["spec"].get("binary", False),
+        mask_hides_heading=ctx["spec"].get("mask_hides_heading", False)
     )
     for split, d in zip(("train", "val", "test"), dm.get_data()):
         for c in ("input_text_1", "input_text_2"):
@@ -175,6 +180,8 @@ def _data_manager(ctx: dict, tokenizer: object, build_for: str) -> object:
                 f'{split} {c}: {int(bad.sum())} inputs carry "nan", e.g. {d[c][bad].iloc[0]!r}'
             )
     print("Sample input:", dm.get_data()[2]["input_text_1"].iloc[0])
+    for view in getattr(dm, "sample_views", []):
+        print("Sample view:", view)
     return dm
 
 
@@ -283,7 +290,7 @@ def _run_multi(ctx: dict) -> tuple:
     from model.get_tokenizer import get_tokenizer
     from model.models.MultiTask import get_model_multi_task
     from utils.compute_weight import compute_class_weight
-    from utils.evaluate import compute_metrics, get_preds_multi
+    from utils.evaluate import aux_accuracy, compute_metrics, get_preds_multi
 
     spec = ctx["spec"]
     tokenizer = get_tokenizer(spec["model"], add_class_tokens=True)
@@ -294,7 +301,7 @@ def _run_multi(ctx: dict) -> tuple:
     assert len(test_ds) == 2 * len(df_test), "create_patterns must give two rows per pair"
     assert dm.NUM_PRODUCT_CLASSES == CONFIG_MODEL.NUM_PRODUCT_CLASSES
 
-    cfg = CONFIG_MODEL.multi_task_args(seed=SEED, output_dir=ctx["scratch"])
+    cfg = CONFIG_MODEL.multi_task_args(seed=ctx["seed"], output_dir=ctx["scratch"])
     if ctx["smoke"]:
         cfg["training_args"]["num_train_epochs"] = 1
     args = TrainingArguments(**cfg["training_args"])
@@ -325,7 +332,10 @@ def _run_multi(ctx: dict) -> tuple:
         **{_trainer_tokenizer_kw(): tokenizer}
     )
     trainer.train()
-    preds, true, logits = get_preds_multi(trainer, test_ds, df_test)
+    output = trainer.predict(test_ds)
+    preds, true, logits = get_preds_multi(trainer, test_ds, df_test, output=output)
+    aux_acc = aux_accuracy(output)
+    print("Masked class head accuracy on test views:", aux_acc)
 
     def save() -> None:
         trainer.save_model(ctx["weights_dir"])
@@ -344,7 +354,9 @@ def _run_multi(ctx: dict) -> tuple:
         "fp16": args.fp16,
         "best_checkpoint": trainer.state.best_model_checkpoint,
         "best_val_f1_macro": trainer.state.best_metric,
-        "vocab_size": len(tokenizer)
+        "vocab_size": len(tokenizer),
+        "mask_hides_heading": bool(spec.get("mask_hides_heading", False)),
+        "aux_acc_test": aux_acc
     }
     return preds, true, df_test, save, extra, logits
 
@@ -561,8 +573,140 @@ def _run_hybrid(ctx: dict) -> tuple:
     return predict(Xte), df_test["label_score"].values, df_test, save, extra, None
 
 
+def _run_ce_recipe(ctx: dict) -> tuple:
+    """A standard cross-encoder trained with the multi-task model's recipe (rebuttal E1).
+
+    Same schedule, optimiser, batch and checkpoint selection (validation Macro-F1) as the full
+    model, but its own head and loss: one 5-way head on [CLS], class-weighted cross-entropy, no
+    class tokens, no masked views, no auxiliary head. It trains on the (A, B) order, as the
+    original baselines did, and predicts both (A, B) and (B, A): preds.csv is (A, B); the
+    average of the two orders (E1b) goes to {tag}_avg_preds.csv and settings["two_order"].
+    """
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from datasets import Dataset
+    from transformers import (
+        AutoModelForSequenceClassification,
+        DataCollatorWithPadding,
+        Trainer,
+        TrainingArguments
+    )
+
+    from config.config_data import CONFIG_DATA
+    from config.config_model import CONFIG_MODEL
+    from model.get_tokenizer import get_tokenizer
+    from utils.compute_weight import compute_class_weight
+    from utils.evaluate import build_result_df, compute_metrics
+    from utils.metrics import stats
+
+    spec = ctx["spec"]
+    tokenizer = get_tokenizer(spec["model"])
+    dm = _data_manager(ctx, tokenizer, "pairs")
+    df_train, df_val, df_test = dm.get_data()
+
+    def dataset(d: object, swap: bool = False) -> object:
+        a, b = ("input_text_2", "input_text_1") if swap else ("input_text_1", "input_text_2")
+        ds = Dataset.from_dict(
+            {
+                "a": d[a].astype(str).tolist(),
+                "b": d[b].astype(str).tolist(),
+                "labels": d["label_score"].astype(int).tolist()
+            }
+        )
+        ds = ds.map(
+            lambda x: tokenizer(x["a"], x["b"], truncation=True, max_length=CONFIG_DATA.MAX_LEN),
+            batched=True,
+            remove_columns=["a", "b"]
+        )
+        return ds
+
+    train_ds, val_ds = dataset(df_train), dataset(df_val)
+    test_ab, test_ba = dataset(df_test), dataset(df_test, swap=True)
+
+    class_weights = compute_class_weight(df_train["label_score"].values)
+    weight = torch.tensor(class_weights, dtype=torch.float32)
+
+    class WeightedTrainer(Trainer):
+        def compute_loss(
+            self, model: object, inputs: dict, return_outputs: bool = False, **kwargs: object
+        ) -> object:
+            labels = inputs.get("labels")
+            out = model(**{k: v for k, v in inputs.items() if k != "labels"})
+            loss = F.cross_entropy(
+                out.logits.float(), labels, weight=weight.to(out.logits.device)
+            )
+            return (loss, out) if return_outputs else loss
+
+    cfg = CONFIG_MODEL.multi_task_args(seed=ctx["seed"], output_dir=ctx["scratch"])
+    if ctx["smoke"]:
+        cfg["training_args"]["num_train_epochs"] = 1
+    args = TrainingArguments(**cfg["training_args"])
+    model = AutoModelForSequenceClassification.from_pretrained(
+        spec["model"], num_labels=ctx["n_classes"], ignore_mismatched_sizes=True
+    ).to(ctx["device"])
+    trainer = WeightedTrainer(
+        model=model,
+        args=args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        data_collator=DataCollatorWithPadding(tokenizer),
+        compute_metrics=compute_metrics,
+        **{_trainer_tokenizer_kw(): tokenizer}
+    )
+    trainer.train()
+
+    def logits_of(ds: object) -> np.ndarray:
+        p = trainer.predict(ds).predictions
+        return p[0] if isinstance(p, tuple) else p
+
+    ab, ba = logits_of(test_ab), logits_of(test_ba)
+    if len(ab) != len(df_test) or len(ba) != len(df_test):
+        raise ValueError(f"Got {len(ab)}/{len(ba)} prediction rows for {len(df_test)} test pairs")
+    logits = np.stack([ab, ba], axis=1)
+    true = df_test["label_score"].values
+    preds = ab.argmax(-1)
+    avg_preds = logits.mean(axis=1).argmax(-1)
+    build_result_df(df_test, true, avg_preds).to_csv(
+        os.path.join(ctx["results_dir"], f"{ctx['tag']}_avg_preds.csv"), index=False
+    )
+    m = stats(true, avg_preds, ctx["n_classes"])
+    two_order = {
+        k: m[k]
+        for k in ("f1_macro", "qwk", "mae", "accuracy", "adjacent_acc", "severe_rate")
+    }
+    two_order["per_class_f1"] = [r["f1"] for r in m["per_class"]]
+    print(
+        f"(A,B)+(B,A) averaged: Macro-F1 {m['f1_macro'] * 100:.2f} | QWK {m['qwk']:.4f} | "
+        f"MAE {m['mae']:.4f}"
+    )
+
+    def save() -> None:
+        trainer.save_model(ctx["weights_dir"])
+        tokenizer.save_pretrained(ctx["weights_dir"])
+
+    extra = {
+        "recipe": "multi-task (Table 7) with the baseline's own head and class-weighted CE",
+        "class_weights": list(map(float, class_weights)),
+        "epochs": args.num_train_epochs,
+        "learning_rate": args.learning_rate,
+        "per_device_batch": args.per_device_train_batch_size,
+        "grad_accum": args.gradient_accumulation_steps,
+        "effective_batch": args.per_device_train_batch_size
+        * args.gradient_accumulation_steps
+        * max(1, args.n_gpu),
+        "fp16": args.fp16,
+        "best_checkpoint": trainer.state.best_model_checkpoint,
+        "best_val_f1_macro": trainer.state.best_metric,
+        "train_order": "(A, B)",
+        "two_order": two_order
+    }
+    return preds, true, df_test, save, extra, logits
+
+
 FAMILIES = {
     "xgboost": _run_xgboost,
+    "ce_recipe": _run_ce_recipe,
     "cross": _run_cross,
     "bi": _run_bi,
     "multi": _run_multi,
@@ -581,6 +725,7 @@ def run_experiment(
     from utils.metrics import binary_metrics, plot_confusion, stats
 
     spec = get_run(run_id)
+    seed = run_seed(run_id)
     tag = run_tag(run_id, smoke)
     n_classes = 2 if spec.get("binary") else 5
     if n_classes == 2 and spec["family"] != "multi":
@@ -596,7 +741,7 @@ def run_experiment(
     print(f"Run {run_id}: {spec['name']}  [{spec['table']}] {spec['row']}")
     smoke_note = "  SMOKE TEST" if smoke else ""
     print(
-        f"family={spec['family']} model={spec['model']} variant={spec['variant']} seed={SEED}{smoke_note}"
+        f"family={spec['family']} model={spec['model']} variant={spec['variant']} seed={seed}{smoke_note}"
     )
     print("=" * 78)
     if smoke:
@@ -612,7 +757,8 @@ def run_experiment(
         "weights_dir": weights_dir,
         "scratch": scratch,
         "n_classes": n_classes,
-        "generator": _setup_determinism(SEED),
+        "seed": seed,
+        "generator": _setup_determinism(seed),
         "device": torch.device("cuda" if torch.cuda.is_available() else "cpu")
     }
     env = _environment()
@@ -634,8 +780,8 @@ def run_experiment(
         "run_id": run_id,
         "tag": tag,
         "smoke": smoke,
-        "seed": SEED,
         **spec,
+        "seed": seed,
         "n_test": int(len(df_test)),
         **{
             k: m[k]

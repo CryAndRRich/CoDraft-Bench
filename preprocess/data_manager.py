@@ -11,9 +11,9 @@ from preprocess.data_loader import (
     create_siamese_dataloader,
     to_dataset
 )
-from preprocess.preprocess_data import preprocess
+from preprocess.preprocess_data import add_text_without_heading, preprocess
 
-PIPELINES = {"ml", "multi_task", "cross_encoder", "siamese"}
+PIPELINES = {"ml", "multi_task", "cross_encoder", "siamese", "pairs"}
 
 
 def class_maps() -> tuple[dict, dict]:
@@ -28,7 +28,8 @@ class DataManager:
         variant: str,
         build_for: str,
         tokenizer: PreTrainedTokenizer | None = None,
-        binary: bool = False
+        binary: bool = False,
+        mask_hides_heading: bool = False
     ) -> None:
         if build_for not in PIPELINES:
             raise ValueError(f"Unknown build_for {build_for!r}. Use one of {sorted(PIPELINES)}.")
@@ -59,12 +60,19 @@ class DataManager:
         if build_for == "ml":
             self.ml_data = create_ml_data(self.df_train, self.df_val, self.df_test)
         elif build_for == "multi_task":
-            self.datasets = tuple(
-                to_dataset(
-                    create_patterns(d, tokenizer, self.class_to_token, self.class_to_id), tokenizer
+            if mask_hides_heading:
+                for d in (self.df_train, self.df_val, self.df_test):
+                    add_text_without_heading(d)
+            patterns = [
+                create_patterns(
+                    d, tokenizer, self.class_to_token, self.class_to_id, mask_hides_heading
                 )
                 for d in (self.df_train, self.df_val, self.df_test)
-            )
+            ]
+            self.sample_views = patterns[2][["text1", "text2"]].head(2).values.tolist()
+            self.datasets = tuple(to_dataset(p, tokenizer) for p in patterns)
+        elif build_for == "pairs":
+            pass
         elif build_for == "cross_encoder":
             self.loaders = create_dataloader_cross_encoder(self.df_train, self.df_val)
         else:

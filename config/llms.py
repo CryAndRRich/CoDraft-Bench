@@ -30,19 +30,34 @@ LLMS = {
 }
 
 
+OPENROUTER = dict(
+    backend="api",
+    base_url="https://openrouter.ai/api/v1",
+    api_key_env="OPENROUTER_API_KEY",
+    batch_size=10,
+    workers=8
+)
+OPENROUTER_PREFIX = "openrouter/"
+
+
 def safe_tag(tag: str) -> str:
+    if tag.startswith(OPENROUTER_PREFIX):
+        return "or-" + tag.split("/")[-1].lower().replace("_", "-").replace(":", "-")
     return tag.split("/")[-1].lower().replace("_", "-")
 
 
 def get_llm(tag: str) -> dict:
     if tag in LLMS:
         spec = {**DEFAULTS, **LLMS[tag]}
+    elif tag.startswith(OPENROUTER_PREFIX):
+        spec = {**DEFAULTS, **OPENROUTER, "model": tag[len(OPENROUTER_PREFIX) :]}
     elif "/" in tag:
         spec = {**DEFAULTS, "model": tag}
     else:
         raise KeyError(
             f"Unknown LLM {tag!r}. Known tags are {sorted(LLMS)}, "
-            f'or pass a Hugging Face id such as "Qwen/Qwen2.5-7B-Instruct".'
+            f'pass a Hugging Face id such as "Qwen/Qwen2.5-7B-Instruct" (served by vLLM), '
+            f'or an OpenRouter model as "openrouter/<provider>/<model>".'
         )
     spec["tag"] = safe_tag(tag)
     return spec
@@ -55,4 +70,7 @@ def describe() -> str:
         tp = str(spec["tensor_parallel"]) if spec["backend"] == "vllm" else "-"
         gated = "  (gated)" if spec["gated"] else ""
         lines.append(f"{tag:18s} {spec['backend']:7s} {tp:>2s}  {spec['model']}{gated}")
+    lines.append(
+        f"{'openrouter/<id>':18s} {'api':7s} {'-':>2s}  any OpenRouter model id; needs OPENROUTER_API_KEY"
+    )
     return "\n".join(lines)
