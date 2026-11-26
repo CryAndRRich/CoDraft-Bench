@@ -74,6 +74,25 @@ def find_variant_root(data_root: str, variant: str, extra: tuple[str, ...] = ())
     return found
 
 
+def find_release_dir(source: int) -> str | None:
+    """weights/<path> of a released run (the folder holding model/ and preds.csv), in this repo or
+    anywhere under /kaggle/input (matched on the path suffix, so any dataset nesting works)."""
+    path = RUNS[source]["path"]
+
+    def ok(d: str) -> bool:
+        return os.path.isfile(os.path.join(d, "model", "model.safetensors"))
+
+    local = os.path.join(REPO_DIR, "weights", path)
+    if ok(local):
+        return local
+    suffix = os.sep + os.path.join("weights", path)
+    for root, dirs, _ in os.walk(KAGGLE_INPUT):
+        if root.endswith(suffix) and ok(root):
+            return root
+        dirs[:] = [d for d in dirs if d not in ("model", "conditions")]
+    return None
+
+
 def find_checkpoint(source: int) -> str:
     path = RUNS[source]["path"]
     tag = run_tag(source)
@@ -83,9 +102,11 @@ def find_checkpoint(source: int) -> str:
             os.path.isfile(os.path.join(d, f)) for f in ("model.safetensors", "config.json")
         )
 
-    for d in (os.environ.get("CODRAFT_CKPT"), os.path.join(REPO_DIR, "weights", path, "model")):
-        if ok(d):
-            return d
+    if ok(os.environ.get("CODRAFT_CKPT")):
+        return os.environ["CODRAFT_CKPT"]
+    release = find_release_dir(source)
+    if release is not None:
+        return os.path.join(release, "model")
     found = []
     for root, _, files in os.walk(KAGGLE_INPUT):
         if {"model.safetensors", "added_tokens.json", "config.json"} <= set(files):
@@ -283,6 +304,64 @@ def _trainer_tokenizer_kw() -> str:
     )
 
 
+MEM_LIMIT_GB = 13.5
+
+
+def _memory_probe(model: object, collator: object, train_ds: object, n: int = 8) -> float | None:
+    """Expected peak VRAM (GiB) of training without gradient checkpointing.
+
+    One forward + backward under fp16 autocast on the n longest training rows, plus 8 bytes per
+    trainable parameter for the AdamW moments that the probe does not allocate. Runs before the
+    Trainer is built, so the Trainer's own seeding is unaffected.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return None
+    with train_ds.formatted_as(None):
+        lengths = [len(x) for x in train_ds["input_ids"]]
+        idx = sorted(range(len(lengths)), key=lengths.__getitem__)[-n:]
+        feats = [train_ds[i] for i in idx]
+    device = next(model.parameters()).device
+    batch = {k: v.to(device) for k, v in collator(feats).items()}
+    was_training = model.training
+    model.train()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    with torch.autocast("cuda", dtype=torch.float16):
+        out = model(**batch)
+    out.loss.backward()
+    peak = torch.cuda.max_memory_allocated()
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model.zero_grad(set_to_none=True)
+    del out, batch
+    model.train(was_training)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    return round((peak + 8 * n_params) / 2**30, 2)
+
+
+def _speed_settings(ctx: dict, cfg: dict, model: object, collator: object, train_ds: object) -> dict:
+    """Rebuttal runs only (spec has "rebuttal"): gradient checkpointing off unless the memory probe
+    says it will not fit, eval batch 64. The paper runs keep their original settings."""
+    spec = ctx["spec"]
+    if "rebuttal" not in spec:
+        return {}
+    gc = bool(spec.get("gradient_checkpointing", os.environ.get("CODRAFT_GC", "0") == "1"))
+    probe = None
+    if not gc:
+        probe = _memory_probe(model, collator, train_ds)
+        if probe is not None and probe > MEM_LIMIT_GB:
+            gc = True
+    cfg["training_args"]["gradient_checkpointing"] = gc
+    cfg["training_args"]["per_device_eval_batch_size"] = 64
+    print(
+        f"Memory probe: {probe} GiB expected peak (limit {MEM_LIMIT_GB}) -> "
+        f"gradient checkpointing {'ON' if gc else 'OFF'}"
+    )
+    return {"gradient_checkpointing": gc, "mem_probe_gb": probe}
+
+
 def _run_multi(ctx: dict) -> tuple:
     from transformers import DataCollatorWithPadding, Trainer, TrainingArguments
 
@@ -304,7 +383,6 @@ def _run_multi(ctx: dict) -> tuple:
     cfg = CONFIG_MODEL.multi_task_args(seed=ctx["seed"], output_dir=ctx["scratch"])
     if ctx["smoke"]:
         cfg["training_args"]["num_train_epochs"] = 1
-    args = TrainingArguments(**cfg["training_args"])
     loss = dict(cfg["loss_args"], loss_type=spec.get("loss_type", "rank_aware"))
     for k in ("aux_weight", "alpha"):
         if k in spec:
@@ -322,12 +400,15 @@ def _run_multi(ctx: dict) -> tuple:
         **loss
     )
     assert model.get_input_embeddings().num_embeddings >= len(tokenizer)
+    collator = DataCollatorWithPadding(tokenizer)
+    speed = _speed_settings(ctx, cfg, model, collator, train_ds)
+    args = TrainingArguments(**cfg["training_args"])
     trainer = Trainer(
         model=model,
         args=args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        data_collator=DataCollatorWithPadding(tokenizer),
+        data_collator=collator,
         compute_metrics=compute_metrics,
         **{_trainer_tokenizer_kw(): tokenizer}
     )
@@ -356,7 +437,8 @@ def _run_multi(ctx: dict) -> tuple:
         "best_val_f1_macro": trainer.state.best_metric,
         "vocab_size": len(tokenizer),
         "mask_hides_heading": bool(spec.get("mask_hides_heading", False)),
-        "aux_acc_test": aux_acc
+        "aux_acc_test": aux_acc,
+        **speed
     }
     return preds, true, df_test, save, extra, logits
 
@@ -641,16 +723,18 @@ def _run_ce_recipe(ctx: dict) -> tuple:
     cfg = CONFIG_MODEL.multi_task_args(seed=ctx["seed"], output_dir=ctx["scratch"])
     if ctx["smoke"]:
         cfg["training_args"]["num_train_epochs"] = 1
-    args = TrainingArguments(**cfg["training_args"])
     model = AutoModelForSequenceClassification.from_pretrained(
         spec["model"], num_labels=ctx["n_classes"], ignore_mismatched_sizes=True
     ).to(ctx["device"])
+    collator = DataCollatorWithPadding(tokenizer)
+    speed = _speed_settings(ctx, cfg, model, collator, train_ds)
+    args = TrainingArguments(**cfg["training_args"])
     trainer = WeightedTrainer(
         model=model,
         args=args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        data_collator=DataCollatorWithPadding(tokenizer),
+        data_collator=collator,
         compute_metrics=compute_metrics,
         **{_trainer_tokenizer_kw(): tokenizer}
     )
@@ -699,9 +783,400 @@ def _run_ce_recipe(ctx: dict) -> tuple:
         "best_checkpoint": trainer.state.best_model_checkpoint,
         "best_val_f1_macro": trainer.state.best_metric,
         "train_order": "(A, B)",
-        "two_order": two_order
+        "two_order": two_order,
+        **speed
     }
     return preds, true, df_test, save, extra, logits
+
+
+def _load_multi_checkpoint(ctx: dict) -> tuple:
+    from transformers import AutoTokenizer
+
+    from model.models.MultiTask import JointClassSimBGE
+    from preprocess.data_manager import class_maps
+
+    ckpt = find_checkpoint(ctx["spec"]["source"])
+    print("Checkpoint:", ckpt)
+    tokenizer = AutoTokenizer.from_pretrained(ckpt, use_fast=False)
+    model = JointClassSimBGE.from_pretrained(ckpt).to(ctx["device"]).eval()
+    class_to_token, class_to_id = class_maps()
+    _check_class_tokens(tokenizer, list(class_to_token.values()))
+    return ckpt, tokenizer, model, class_to_token, class_to_id
+
+
+def _predict_trainer(ctx: dict, model: object, tokenizer: object) -> object:
+    """Prediction-only Trainer with the settings of the input probe (run 19), which reproduces run
+    7's logits exactly: fp16, eval batch 16."""
+    import torch
+    from transformers import DataCollatorWithPadding, Trainer, TrainingArguments
+
+    args = TrainingArguments(
+        output_dir=ctx["scratch"],
+        per_device_eval_batch_size=16,
+        report_to="none",
+        fp16=torch.cuda.is_available(),
+        remove_unused_columns=False,
+        dataloader_num_workers=2
+    )
+    return Trainer(
+        model=model,
+        args=args,
+        data_collator=DataCollatorWithPadding(tokenizer),
+        **{_trainer_tokenizer_kw(): tokenizer}
+    )
+
+
+def _predict_views(trainer: object, frame: object, tokenizer: object, maps: tuple) -> tuple:
+    from preprocess.data_loader import create_patterns, to_dataset
+    from utils.evaluate import get_preds_multi
+
+    ds = to_dataset(create_patterns(frame, tokenizer, *maps), tokenizer)
+    out = trainer.predict(ds)
+    preds, true, avg = get_preds_multi(trainer, ds, frame, output=out)
+    return preds, true, avg, out
+
+
+def _original_run(source: int) -> tuple:
+    """preds.csv (and logits.npy if present) of a released run, for the reproduction checks."""
+    import numpy as np
+    import pandas as pd
+
+    release = find_release_dir(source)
+    preds = pd.read_csv(os.path.join(release, "preds.csv"))
+    lg = os.path.join(release, "logits.npy")
+    return preds, (np.load(lg) if os.path.isfile(lg) else None)
+
+
+def _agreement(df_test: object, preds: object, logits: object, source: int) -> dict:
+    import numpy as np
+    import pandas as pd
+
+    orig, orig_logits = _original_run(source)
+    pos = pd.Series(np.arange(len(orig)), index=orig["Pair ID"].astype(str).values)
+    idx = pos.reindex(df_test["Pair ID"].astype(str).values)
+    keep = idx.notna().to_numpy()
+    idx = idx[keep].astype(int).to_numpy()
+    out = {
+        "n_compared": int(keep.sum()),
+        "pred_agreement": float((np.asarray(preds)[keep] == orig["pred"].values[idx]).mean())
+    }
+    if orig_logits is not None and logits is not None:
+        diff = np.abs(np.asarray(logits)[keep] - orig_logits[idx])
+        out["logits_max_abs_diff"] = float(diff.max())
+    print(f"Reproduction of run {source}: {out}")
+    return out
+
+
+def _test_frame(ctx: dict, split: str = "test") -> object:
+    import pandas as pd
+
+    from preprocess.preprocess_data import preprocess
+
+    raw = pd.read_csv(
+        os.path.join(ctx["data_root"], ctx["spec"]["variant"], f"{split}.csv"), low_memory=False
+    )
+    return raw, preprocess(raw.copy())
+
+
+def _run_aux_head(ctx: dict) -> tuple:
+    """Rebuttal E9a: accuracy of run 7's masked class head, which training uses but the paper never
+    measured. Inference only. Also checks that run 7 is reproduced (preds and logits)."""
+    import numpy as np
+    import pandas as pd
+
+    spec = ctx["spec"]
+    ckpt, tokenizer, model, c2t, c2i = _load_multi_checkpoint(ctx)
+    id_to_class = {v: k for k, v in c2i.items()}
+    trainer = _predict_trainer(ctx, model, tokenizer)
+    extra = {"checkpoint": ckpt}
+    for split in ("val", "test"):
+        _, frame = _test_frame(ctx, split)
+        preds, true, avg, out = _predict_views(trainer, frame, tokenizer, (c2t, c2i))
+        aux_pred = np.argmax(out.predictions[1], axis=-1)
+        aux_true = np.asarray(out.label_ids[1])
+        hit = aux_pred == aux_true
+        per_class = {
+            int(id_to_class[c]): {"n": int((aux_true == c).sum()), "acc": float(hit[aux_true == c].mean())}
+            for c in np.unique(aux_true)
+        }
+        extra[f"aux_acc_{split}"] = float(hit.mean())
+        extra[f"aux_per_class_{split}"] = per_class
+        extra[f"aux_worst_classes_{split}"] = sorted(per_class.items(), key=lambda kv: kv[1]["acc"])[:5]
+        print(f"[E9a] {split}: masked class head accuracy {hit.mean() * 100:.2f}% on {len(hit)} views")
+        if split == "test":
+            test_frame, test = frame, (preds, true, avg)
+            pd.DataFrame(
+                {
+                    "Pair ID": np.repeat(frame["Pair ID"].values, 2),
+                    "masked_side": np.tile([1, 2], len(frame)),
+                    "class_true": [int(id_to_class[c]) for c in aux_true],
+                    "class_pred": [int(id_to_class[c]) for c in aux_pred]
+                }
+            ).to_csv(os.path.join(ctx["results_dir"], f"{ctx['tag']}_aux_preds.csv"), index=False)
+    preds, true, avg = test
+    extra["reproduction"] = _agreement(test_frame, preds, avg, spec["source"])
+    return preds, true, test_frame, None, extra, avg
+
+
+def _annotations(ctx: dict) -> tuple:
+    """Majority vote of the three annotators behind the paper's Table 10 (TNH, VBD, NVTK) over the
+    135 rated descriptions, keyed by (normalised description, NICE class), as in analysis/rebuttal.py
+    (E5a). Returns (ratings, samples, annotate_dir, norm, counts)."""
+    import re
+
+    import pandas as pd
+
+    def ok(d: str | None) -> bool:
+        return bool(d) and os.path.isfile(os.path.join(d, "Samples.csv"))
+
+    cands = [os.path.join(ctx["full_data_root"], "annotate"), os.path.join(REPO_DIR, "data", "annotate")]
+    where = next((d for d in cands if ok(d)), None) or _search_kaggle(ok)
+    if where is None:
+        raise FileNotFoundError("data/annotate/Samples.csv not found (copy it from COLING/annotate/)")
+    samples = pd.read_csv(os.path.join(where, "Samples.csv"))
+    votes = {}
+    for a in ("TNH", "VBD", "NVTK"):
+        d = pd.read_csv(os.path.join(where, f"Annotation_{a}.csv"), encoding="utf-8-sig")
+        assert (d["PairID"].values == samples["PairID"].values).all(), a
+        votes[a] = d
+    nat = sum(votes[a]["Nature"] for a in votes) >= 2
+    pur = sum(votes[a]["Purpose"] for a in votes) >= 2
+
+    def norm(x: object) -> str:
+        return re.sub(r"\s+", " ", str(x)).strip().lower()
+
+    ratings = {
+        (norm(t), int(c)): (bool(n), bool(p))
+        for t, c, n, p in zip(samples["Term"], samples["Class"], nat, pur)
+    }
+    counts = {
+        "rows": len(samples),
+        "distinct_descriptions": len(ratings),
+        "nature_failed_rows": int((~nat).sum()),
+        "purpose_failed_rows": int((~pur).sum()),
+        "nature_failed_distinct": int(sum(not v[0] for v in ratings.values())),
+        "purpose_failed_distinct": int(sum(not v[1] for v in ratings.values()))
+    }
+    return ratings, samples, where, norm, counts
+
+
+def _run_counterfactual(ctx: dict) -> tuple:
+    """Rebuttal E5 (counterfactual): re-predict with run 7 after replacing only the attributes that
+    the annotators failed. Inference only, no retraining.
+
+    Conditions (each on the whole test set; only the listed sides change):
+      original             run 7's own inputs (must reproduce run 7)
+      drop_failed          failed Nature/Purpose removed
+      llm_<tag>            failed Nature/Purpose replaced by that open LLM's attribute for the
+                           same pair and side (data/codraft_<tag>/, runs 21-24)
+      control_drop_nature  on the *pass* pairs, the Nature of every rated side removed: how much
+                           removing an attribute moves predictions by itself
+      corrected            only if data/annotate/corrections.csv exists (PairID of Samples.csv,
+                           Nature, Purpose; blank keeps the original)
+    """
+    import numpy as np
+    import pandas as pd
+
+    from preprocess.preprocess_data import create_structured_text_enhanced
+    from utils.evaluate import build_result_df
+    from utils.metrics import stats
+
+    spec, tag = ctx["spec"], ctx["tag"]
+    ratings, samples, annotate_dir, norm, counts = _annotations(ctx)
+    raw, base = _test_frame(ctx)
+    n = len(raw)
+    attr = {
+        (s, a): raw[f"{a} {s}"].fillna("").astype(str).to_numpy(dtype=object)
+        for s in ("1", "2")
+        for a in ("Nature", "Purpose")
+    }
+    status = {
+        s: [ratings.get((norm(t), int(c))) for t, c in zip(raw[f"Term {s}"], raw[f"Class {s}"])]
+        for s in ("1", "2")
+    }
+    failed = {
+        (s, a): np.array([st is not None and not st[k] for st in status[s]])
+        for s in ("1", "2")
+        for k, a in enumerate(("Nature", "Purpose"))
+    }
+    rated = {s: np.array([st is not None for st in status[s]]) for s in ("1", "2")}
+    fail_pair = np.zeros(n, bool)
+    for m in failed.values():
+        fail_pair |= m
+    pass_pair = (rated["1"] | rated["2"]) & ~fail_pair
+
+    def frame(values: dict) -> pd.DataFrame:
+        d = base.copy()
+        for s in ("1", "2"):
+            d[f"input_text_{s}"] = [
+                create_structured_text_enhanced(t, a, b, c)
+                for t, a, b, c in zip(
+                    d[f"Term {s}"], values[(s, "Nature")], values[(s, "Purpose")], d[f"Class {s}"]
+                )
+            ]
+        return d
+
+    def replaced(source: dict, where: dict) -> tuple:
+        v = {k: x.copy() for k, x in attr.items()}
+        for k, m in where.items():
+            v[k][m] = source[k][m] if source is not None else ""
+        return v
+
+    conditions = {"original": (attr, None), "drop_failed": (replaced(None, failed), "fail")}
+    llm_missing = {}
+    for llm in ("qwen2.5-7b", "qwen3-8b", "llama3.1-8b", "nemotron-nano-8b"):
+        try:
+            root = find_variant_root(ctx["full_data_root"], f"codraft_{llm}")
+        except FileNotFoundError:
+            llm_missing[llm] = "variant not found"
+            continue
+        other = pd.read_csv(os.path.join(root, f"codraft_{llm}", "test.csv"), low_memory=False)
+        other = other.set_index(other["Pair ID"].astype(str)).reindex(raw["Pair ID"].astype(str))
+        src = {
+            (s, a): other[f"{a} {s}"].fillna("").astype(str).to_numpy(dtype=object)
+            for s in ("1", "2")
+            for a in ("Nature", "Purpose")
+        }
+        conditions[f"llm_{llm}"] = (replaced(src, failed), "fail")
+    nature_rated = {(s, "Nature"): rated[s] & pass_pair for s in ("1", "2")}
+    conditions["control_drop_nature"] = (replaced(None, nature_rated), "pass")
+    corr_path = os.path.join(annotate_dir, "corrections.csv")
+    if os.path.isfile(corr_path):
+        corr = pd.read_csv(corr_path).merge(samples[["PairID", "Term", "Class"]], on="PairID")
+        fix = {}
+        for _, r in corr.iterrows():
+            fix[(norm(r["Term"]), int(r["Class"]))] = (r.get("Nature"), r.get("Purpose"))
+        v = {k: x.copy() for k, x in attr.items()}
+        for s in ("1", "2"):
+            for i, (t, c) in enumerate(zip(raw[f"Term {s}"], raw[f"Class {s}"])):
+                f = fix.get((norm(t), int(c)))
+                for k, a in enumerate(("Nature", "Purpose")):
+                    if f is not None and isinstance(f[k], str) and f[k].strip():
+                        v[(s, a)][i] = f[k].strip()
+        conditions["corrected"] = (v, "fail")
+
+    ckpt, tokenizer, model, c2t, c2i = _load_multi_checkpoint(ctx)
+    trainer = _predict_trainer(ctx, model, tokenizer)
+    y = base["label_score"].to_numpy()
+    subsets = {"fail": fail_pair, "pass": pass_pair}
+    results, orig = {}, None
+    for name, (values, subset) in conditions.items():
+        d = frame(values)
+        changed = np.zeros(n, bool)
+        for s in ("1", "2"):
+            changed |= d[f"input_text_{s}"].to_numpy() != base[f"input_text_{s}"].to_numpy()
+        p, t, lg, _ = _predict_views(trainer, d, tokenizer, (c2t, c2i))
+        build_result_df(d, t, p).to_csv(
+            os.path.join(ctx["results_dir"], f"{tag}_{name}_preds.csv"), index=False
+        )
+        np.save(os.path.join(ctx["results_dir"], f"{tag}_{name}_logits.npy"), lg)
+        if name == "original":
+            orig = (p, lg)
+            assert not changed.any(), "the original condition must rebuild run 7's inputs exactly"
+        m = stats(t, p)
+        r = {
+            "pairs_with_changed_input": int(changed.sum()),
+            "f1_macro_test": m["f1_macro"],
+            "qwk_test": m["qwk"],
+            "mae_test": m["mae"],
+            "example": d.loc[changed, "input_text_1"].head(2).tolist() if changed.any() else []
+        }
+        if subset is not None:
+            sel = subsets[subset]
+            w0, w1 = orig[0][sel] != y[sel], p[sel] != y[sel]
+            s0 = np.abs(orig[0][sel] - y[sel]) >= 2
+            s1 = np.abs(p[sel] - y[sel]) >= 2
+            r.update(
+                subset=subset,
+                n=int(sel.sum()),
+                pred_changed=int((orig[0][sel] != p[sel]).sum()),
+                wrong_to_right=int((w0 & ~w1).sum()),
+                right_to_wrong=int((~w0 & w1).sum()),
+                err_before=float(w0.mean()) if sel.any() else None,
+                err_after=float(w1.mean()) if sel.any() else None,
+                severe_before=float(s0.mean()) if sel.any() else None,
+                severe_after=float(s1.mean()) if sel.any() else None
+            )
+        results[name] = r
+        print(f"[E5] {name:22s} " + ", ".join(f"{k}={v}" for k, v in r.items() if k != "example"))
+    extra = {
+        "checkpoint": ckpt,
+        "annotators": ["TNH", "VBD", "NVTK"],
+        "failed_descriptions": counts,
+        "pairs": {"fail": int(fail_pair.sum()), "pass": int(pass_pair.sum())},
+        "failed_sides": {f"{a} {s}": int(m.sum()) for (s, a), m in failed.items()},
+        "llm_missing": llm_missing,
+        "corrections": corr_path if "corrected" in conditions else "none (no data/annotate/corrections.csv)",
+        "conditions": results,
+        "reproduction": _agreement(base, orig[0], orig[1], spec["source"])
+    }
+    return orig[0], y, base, None, extra, orig[1]
+
+
+def _run_ce_two_order(ctx: dict) -> tuple:
+    """Rebuttal E1b on the original cross-encoders (runs 3-6): predict (A, B), as the paper did,
+    and (B, A), and average the two. Inference only, fp32 and batches of 32 like
+    sentence-transformers' CrossEncoder.predict, so (A, B) reproduces the released preds.csv.
+    preds.csv = the two orders averaged; conditions/ab_preds.csv = (A, B) alone."""
+    import numpy as np
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    from config.config_data import CONFIG_DATA
+    from utils.evaluate import build_result_df
+    from utils.metrics import stats
+
+    spec = ctx["spec"]
+    release = find_release_dir(spec["source"])
+    if release is None:
+        raise FileNotFoundError(
+            f"weights/{RUNS[spec['source']]['path']}/model not found; attach codraft-weight"
+        )
+    ckpt = os.path.join(release, "model")
+    print("Checkpoint:", ckpt)
+    tokenizer = AutoTokenizer.from_pretrained(ckpt)
+    model = AutoModelForSequenceClassification.from_pretrained(ckpt).to(ctx["device"]).eval()
+    dm = _data_manager(ctx, tokenizer, "pairs")
+    df_test = dm.get_data()[2]
+    a = [str(x) for x in df_test["input_text_1"]]
+    b = [str(x) for x in df_test["input_text_2"]]
+
+    def logits_of(first: list, second: list) -> np.ndarray:
+        out = []
+        with torch.no_grad():
+            for i in range(0, len(first), 32):
+                enc = tokenizer(
+                    first[i : i + 32],
+                    second[i : i + 32],
+                    padding=True,
+                    truncation="longest_first",
+                    max_length=CONFIG_DATA.MAX_LEN,
+                    return_tensors="pt"
+                ).to(ctx["device"])
+                out.append(model(**enc).logits.float().cpu().numpy())
+        return np.concatenate(out)
+
+    ab, ba = logits_of(a, b), logits_of(b, a)
+    logits = np.stack([ab, ba], axis=1)
+    true = df_test["label_score"].values
+    ab_preds, preds = ab.argmax(-1), logits.mean(axis=1).argmax(-1)
+    build_result_df(df_test, true, ab_preds).to_csv(
+        os.path.join(ctx["results_dir"], f"{ctx['tag']}_ab_preds.csv"), index=False
+    )
+    m = stats(true, ab_preds, ctx["n_classes"])
+    ab_metrics = {k: m[k] for k in ("f1_macro", "qwk", "mae", "accuracy", "adjacent_acc", "severe_rate")}
+    ab_metrics["per_class_f1"] = [r["f1"] for r in m["per_class"]]
+    print(
+        f"[E1b] (A,B) only: Macro-F1 {m['f1_macro'] * 100:.2f} | QWK {m['qwk']:.4f} | MAE {m['mae']:.4f}"
+    )
+    extra = {
+        "checkpoint": ckpt,
+        "source_run": spec["source"],
+        "inference": "fp32, batch 32, max_length 256, truncation longest_first",
+        "ab_metrics": ab_metrics,
+        "reproduction": _agreement(df_test, ab_preds, None, spec["source"])
+    }
+    return preds, true, df_test, None, extra, logits
 
 
 FAMILIES = {
@@ -711,7 +1186,10 @@ FAMILIES = {
     "bi": _run_bi,
     "multi": _run_multi,
     "probe": _run_probe,
-    "hybrid": _run_hybrid
+    "hybrid": _run_hybrid,
+    "aux_head": _run_aux_head,
+    "counterfactual": _run_counterfactual,
+    "ce_two_order": _run_ce_two_order
 }
 
 
@@ -744,6 +1222,7 @@ def run_experiment(
         f"family={spec['family']} model={spec['model']} variant={spec['variant']} seed={seed}{smoke_note}"
     )
     print("=" * 78)
+    full_data_root = data_root
     if smoke:
         data_root = _smoke_data(data_root, spec["variant"], os.path.join(scratch, "data"))
     print("Data:", data_root)
@@ -753,6 +1232,7 @@ def run_experiment(
         "tag": tag,
         "smoke": smoke,
         "data_root": data_root,
+        "full_data_root": full_data_root,
         "results_dir": results_dir,
         "weights_dir": weights_dir,
         "scratch": scratch,
@@ -764,7 +1244,11 @@ def run_experiment(
     env = _environment()
     print("Environment:", json.dumps(env))
     t0 = time.time()
-    preds, true, df_test, save, extra, logits = FAMILIES[spec["family"]](ctx)
+    try:
+        preds, true, df_test, save, extra, logits = FAMILIES[spec["family"]](ctx)
+    except BaseException:
+        shutil.rmtree(scratch, ignore_errors=True)
+        raise
 
     true = np.asarray(true).astype(int)
     preds = np.asarray(preds).astype(int)
@@ -800,12 +1284,17 @@ def run_experiment(
     with open(os.path.join(results_dir, f"{tag}_metrics.json"), "w") as fh:
         json.dump(record, fh, indent=2, default=float)
 
-    if save is not None:
+    if save is not None and os.environ.get("CODRAFT_SAVE_WEIGHTS", "1") == "0":
+        print("CODRAFT_SAVE_WEIGHTS=0: model weights not saved.")
+    elif save is not None:
         try:
             save()
             print("Weights:", weights_dir)
         except Exception as e:
             print(f"Could not save the weights ({type(e).__name__}: {e}); the results are kept.")
+    shutil.rmtree(scratch, ignore_errors=True)
+    if os.path.isdir(weights_dir) and not os.listdir(weights_dir):
+        os.rmdir(weights_dir)
 
     b = record["binary"]
     print("\n" + "=" * 78)
@@ -857,9 +1346,30 @@ def _stream(proc: subprocess.Popen, prefix: str, log_path: str, progress_every: 
             _say(f"{prefix} {buf.strip()}")
 
 
+def _fits(elapsed_min: float, est_min: float | None, budget_hours: float | None) -> bool:
+    """True if a run expected to take est_min (with a 30% margin) ends inside the budget."""
+    if budget_hours is None or est_min is None:
+        return True
+    return elapsed_min + 1.3 * est_min <= 60 * budget_hours
+
+
 def launch(
-    run_ids: int | list[int], data_root: str | None = None, out_root: str = ".", smoke: bool = False
-) -> None:
+    run_ids: int | list[int],
+    data_root: str | None = None,
+    out_root: str = ".",
+    smoke: bool = False,
+    budget_hours: float | None = None,
+    package_zip: bool = True
+) -> dict:
+    """Run several experiments, one GPU each, from a shared queue.
+
+    budget_hours: a run is started only if its EST_MIN (config/runs.py) fits in what is left, so a
+    Kaggle session is never cut at its time limit. package_zip=False leaves the files loose for
+    the caller to zip. Returns {"failed": [...], "skipped": [...]}; raises if a run failed.
+    """
+    from config.runs import EST_MIN
+
+    t_start = time.time()
     ids = [run_ids] if isinstance(run_ids, int) else list(run_ids)
     for run_id in ids:
         get_run(run_id)
@@ -872,12 +1382,20 @@ def launch(
     if len(ids) > slots:
         print(f"More runs than GPUs: they will share {slots} card(s) in turn.")
 
-    pending, running, failed = list(ids), {}, []
+    pending, running, failed, skipped = list(ids), {}, [], []
     while pending or running:
         for slot in range(slots):
             if slot in running or not pending:
                 continue
             run_id = pending.pop(0)
+            elapsed = (time.time() - t_start) / 60
+            if not smoke and not _fits(elapsed, EST_MIN.get(run_id), budget_hours):
+                skipped.append(run_id)
+                print(
+                    f"Skipped run {run_id}: ~{EST_MIN[run_id]} min would pass the "
+                    f"{budget_hours} h budget ({elapsed:.0f} min used)"
+                )
+                continue
             env = dict(os.environ, PYTHONUNBUFFERED="1")
             if n_gpu:
                 env["CUDA_VISIBLE_DEVICES"] = str(slot)
@@ -924,9 +1442,15 @@ def launch(
         time.sleep(2)
 
     summary(out_root, smoke=smoke)
-    package([run_tag(run_id, smoke) for run_id in ids], out_root)
+    done = [run_id for run_id in ids if run_id not in skipped]
+    if package_zip and done:
+        package([run_tag(run_id, smoke) for run_id in done], out_root)
+    print(f"Wall time {(time.time() - t_start) / 60:.0f} min")
+    if skipped:
+        print(f"Skipped for time: {skipped}. Run them in another session.")
     if failed:
         raise RuntimeError(f"Runs failed: {failed}. The full output is in {log_dir}/")
+    return {"failed": failed, "skipped": skipped}
 
 
 def package(tags: list[str], out_root: str = ".") -> str | None:

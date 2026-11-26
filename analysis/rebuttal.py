@@ -315,7 +315,7 @@ def section_e5(te: pd.DataFrame, P: dict) -> tuple:
         "",
         "Small n: indicative only. Matching is on (normalised description, class). The run 12 column "
         "is a control: if it is just as high on *fail* pairs, those pairs are hard regardless of the "
-        "attributes. The counterfactual (correct the attribute, re-predict) needs run 7's checkpoint.",
+        "attributes. The counterfactual (replace the failed attribute, re-predict with run 7) is run 43.",
         "",
     ]
     return lines, rows
@@ -427,7 +427,66 @@ def section_new(y: np.ndarray, te_ids: np.ndarray, P: dict) -> tuple:
                 f"| E1b run {avg}: two orders averaged − (A, B) only | {fmt(paired(y, pa, P[avg]))} | "
                 f"{fmt(paired(y, pa, P[avg], 'qwk'), 3)} | {fmt(paired(y, pa, P[avg], 'mae'), 3)} |"
             )
-    seeds = {"full model (7, 30, 31)": (7, 30, 31), "w/o CoDraft (12, 32, 33)": (12, 32, 33)}
+    for old in (44, 45, 46, 47):
+        pa = P.get(old)
+        pab = load_preds(old, te_ids, "ab") if old in found else None
+        if pa is not None and pab is not None:
+            src = RUNS[old]["source"]
+            lines.append(
+                f"| E1b original CE run {src}: two orders averaged − (A, B) only | {fmt(paired(y, pa, pab))} | "
+                f"{fmt(paired(y, pa, pab, 'qwk'), 3)} | {fmt(paired(y, pa, pab, 'mae'), 3)} |"
+            )
+    rep = []
+    for r in (42, 43, 44, 45, 46, 47):
+        st = (load_metrics(r) or {}).get("settings", {}) if r in found else {}
+        if "reproduction" in st:
+            rr = st["reproduction"]
+            diff = f", max |Δ logit| {rr['logits_max_abs_diff']:.2g}" if "logits_max_abs_diff" in rr else ""
+            rep.append(f"run {r}: {rr['pred_agreement'] * 100:.2f}% of {rr['n_compared']}{diff}")
+    if rep:
+        lines += ["", "Reproduction of the released predictions by the inference runs: " + "; ".join(rep) + "."]
+    st42 = (load_metrics(42) or {}).get("settings", {}) if 42 in found else {}
+    if "aux_acc_test" in st42:
+        worst = ", ".join(
+            f"class {c} {v['acc'] * 100:.1f}% (n={v['n']})" for c, v in st42.get("aux_worst_classes_test", [])
+        )
+        lines += [
+            "",
+            f"- E9a run 7 masked class head: val {st42['aux_acc_val'] * 100:.2f}%, test "
+            f"{st42['aux_acc_test'] * 100:.2f}% of masked views; lowest classes on test: {worst}.",
+        ]
+    seed_aux = [
+        (r, (load_metrics(r) or {}).get("settings", {}).get("aux_acc_test")) for r in (30, 31, 35) if r in found
+    ]
+    seed_aux = [(r, a) for r, a in seed_aux if a is not None]
+    if seed_aux:
+        lines.append("- Class head accuracy on test, new runs: " + ", ".join(f"run {r} {a * 100:.2f}%" for r, a in seed_aux))
+    st43 = (load_metrics(43) or {}).get("settings", {}) if 43 in found else {}
+    if "conditions" in st43:
+        lines += [
+            "",
+            f"**E5 counterfactual (run 7, inference only).** Pairs with a failed attribute: "
+            f"{st43['pairs']['fail']}; pairs whose rated attributes all pass: {st43['pairs']['pass']}. "
+            f"Corrections: {st43['corrections']}.",
+            "",
+            "| condition | pairs | inputs changed | predictions changed | wrong → right | right → wrong | error % before → after | severe % before → after | test Macro-F1 |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+        for name, c in st43["conditions"].items():
+            if "n" not in c:
+                continue
+            lines.append(
+                f"| {name} | {c['subset']} ({c['n']}) | {c['pairs_with_changed_input']} | {c['pred_changed']} | "
+                f"{c['wrong_to_right']} | {c['right_to_wrong']} | {c['err_before'] * 100:.1f} → {c['err_after'] * 100:.1f} | "
+                f"{c['severe_before'] * 100:.1f} → {c['severe_after'] * 100:.1f} | {c['f1_macro_test'] * 100:.2f} |"
+            )
+        rows += [{"section": "E5cf", "condition": k, **{kk: vv for kk, vv in c.items() if kk != "example"}} for k, c in st43["conditions"].items()]
+    seeds = {
+        "full model (7, 30, 31)": (7, 30, 31),
+        "w/o CoDraft (12, 32, 33)": (12, 32, 33),
+        "same-recipe CE bge, vanilla (26, 38, 40)": (26, 38, 40),
+        "same-recipe CE bge, CoDraft (27, 39, 41)": (27, 39, 41),
+    }
     lines += [""]
     for what, ids in seeds.items():
         have = [i for i in ids if i in P]
@@ -437,6 +496,13 @@ def section_new(y: np.ndarray, te_ids: np.ndarray, P: dict) -> tuple:
                 f"- E2 {what}, {len(have)} seeds: "
                 + ", ".join(f"{m} {np.mean(v):.3f} ± {np.std(v, ddof=1):.3f}" for m, v in vals.items())
             )
+    for what, pairs_ in (
+        ("full model − same-recipe CE bge CoDraft per seed", ((7, 27), (30, 39), (31, 41))),
+        ("same-recipe CE bge CoDraft − vanilla per seed", ((27, 26), (39, 38), (41, 40))),
+    ):
+        g = [macro_f1(y, P[a]) - macro_f1(y, P[b]) for a, b in pairs_ if a in P and b in P]
+        if len(g) > 1:
+            lines.append(f"- E2 {what}: {', '.join(f'{x:+.2f}' for x in g)}; mean {np.mean(g):+.2f} ± {np.std(g, ddof=1):.2f}.")
     gains = [
         macro_f1(y, P[a]) - macro_f1(y, P[b]) for a, b in ((7, 12), (30, 32), (31, 33)) if a in P and b in P
     ]

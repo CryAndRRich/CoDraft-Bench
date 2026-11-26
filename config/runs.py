@@ -408,8 +408,113 @@ RUNS = {
         row="run 27, seed 2026",
         path="rebuttal/seeds/ce-same-recipe_bge-reranker-v2-m3_codraft_seed2026",
         rebuttal="E2"
+    ),
+    42: dict(
+        name="aux_head_run07",
+        family="aux_head",
+        model=BGE_RERANKER,
+        variant="codraft",
+        source=7,
+        table="Rebuttal E9a",
+        row="accuracy of run 7's masked class head on val and test (inference only)",
+        path="rebuttal/class-head-accuracy/run7",
+        rebuttal="E9a"
+    ),
+    43: dict(
+        name="counterfactual_run07",
+        family="counterfactual",
+        model=BGE_RERANKER,
+        variant="codraft",
+        source=7,
+        table="Rebuttal E5",
+        row="run 7 re-predicted after replacing the attributes that the annotators failed (inference only)",
+        path="rebuttal/counterfactual/run7",
+        rebuttal="E5"
+    ),
+    44: dict(
+        name="ce_two_order_deberta_plain",
+        family="ce_two_order",
+        model=DEBERTA,
+        variant="plain",
+        source=3,
+        table="Rebuttal E1b",
+        row="run 3 (original CE deberta, vanilla) with (A, B) and (B, A) averaged (inference only)",
+        path="rebuttal/ce-two-order/cross-encoder_deberta-v3-base_plain",
+        rebuttal="E1b"
+    ),
+    45: dict(
+        name="ce_two_order_deberta_codraft",
+        family="ce_two_order",
+        model=DEBERTA,
+        variant="codraft",
+        source=4,
+        table="Rebuttal E1b",
+        row="run 4 (original CE deberta, CoDraft) with (A, B) and (B, A) averaged (inference only)",
+        path="rebuttal/ce-two-order/cross-encoder_deberta-v3-base_codraft",
+        rebuttal="E1b"
+    ),
+    46: dict(
+        name="ce_two_order_bge_codraft",
+        family="ce_two_order",
+        model=BGE_RERANKER,
+        variant="codraft",
+        source=5,
+        table="Rebuttal E1b",
+        row="run 5 (original CE bge-reranker, CoDraft) with (A, B) and (B, A) averaged (inference only)",
+        path="rebuttal/ce-two-order/cross-encoder_bge-reranker-v2-m3_codraft",
+        rebuttal="E1b"
+    ),
+    47: dict(
+        name="ce_two_order_bge_plain",
+        family="ce_two_order",
+        model=BGE_RERANKER,
+        variant="plain",
+        source=6,
+        table="Rebuttal E1b",
+        row="run 6 (original CE bge-reranker, vanilla) with (A, B) and (B, A) averaged (inference only)",
+        path="rebuttal/ce-two-order/cross-encoder_bge-reranker-v2-m3_plain",
+        rebuttal="E1b"
     )
 }
+
+# Expected minutes on one T4 for the rebuttal runs, with gradient checkpointing off (about 0.75 of
+# the measured train_seconds of the matching paper runs). launch(budget_hours=...) uses them to
+# skip a run that would not finish before the Kaggle session ends.
+EST_MIN = {
+    26: 65, 27: 80, 28: 30, 29: 35,
+    30: 155, 31: 155, 32: 135, 33: 135,
+    34: 8, 35: 155, 36: 155, 37: 155,
+    38: 65, 39: 80, 40: 65, 41: 80,
+    42: 6, 43: 10, 44: 4, 45: 4, 46: 6, 47: 6
+}
+
+# Kaggle sessions for scripts/rebuttal.ipynb, longest first so the two cards finish together.
+SESSIONS = {
+    "A": [30, 31, 32, 33, 27, 26, 29, 28, 43, 42, 46, 47, 45, 44, 34],
+    "B": [35, 36, 37, 39, 41, 38, 40]
+}
+CHECKPOINT_RUNS = ("aux_head", "counterfactual", "ce_two_order")
+
+
+def smoke_key(run_id: int) -> tuple:
+    r = RUNS[run_id]
+    model = r["model"] if r["family"] in ("ce_recipe", "ce_two_order") else None
+    return (r["family"], model, r.get("loss_type"), bool(r.get("mask_hides_heading")))
+
+
+def smoke_ids(run_ids: list[int]) -> list[int]:
+    """One run per distinct code path, so a smoke test covers every path a session will take."""
+    seen, out = set(), []
+    for run_id in run_ids:
+        key = smoke_key(run_id)
+        if key not in seen:
+            seen.add(key)
+            out.append(run_id)
+    return out
+
+
+def needs_checkpoints(run_ids: list[int]) -> list[int]:
+    return sorted({RUNS[r]["source"] for r in run_ids if RUNS[r]["family"] in CHECKPOINT_RUNS})
 
 
 def get_run(run_id: int) -> dict:
