@@ -349,7 +349,7 @@ RUNS = {
         loss_type="coral",
         aux_weight=0.0,
         table="Rebuttal E7",
-        row="CORAL ordinal head instead of the 5-way head and rank-aware loss, no masked class head (compare with run 18)",
+        row="CORAL ordinal head instead of the 5-way head and rank-aware loss, no masked class head (compare with run 18); INVALID: biases did not train, see runs 48-49",
         path="rebuttal/ordinal-heads/coral",
         rebuttal="E7"
     ),
@@ -474,6 +474,34 @@ RUNS = {
         row="run 6 (original CE bge-reranker, vanilla) with (A, B) and (B, A) averaged (inference only)",
         path="rebuttal/ce-two-order/cross-encoder_bge-reranker-v2-m3_plain",
         rebuttal="E1b"
+    ),
+    48: dict(
+        name="multi_codraft_coral_prior",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft",
+        loss_type="coral",
+        aux_weight=0.0,
+        rank_bias_init="prior",
+        rank_bias_lr=1e-3,
+        table="Rebuttal E7",
+        row="CORAL, fixed: biases start at logit P(y > k) of the training labels and train at lr 1e-3 (compare with runs 18, 37)",
+        path="rebuttal/ordinal-heads/coral_prior-init_bias-lr1e-3",
+        rebuttal="E7"
+    ),
+    49: dict(
+        name="multi_codraft_coral_prior_lr1e2",
+        family="multi",
+        model=BGE_RERANKER,
+        variant="codraft",
+        loss_type="coral",
+        aux_weight=0.0,
+        rank_bias_init="prior",
+        rank_bias_lr=1e-2,
+        table="Rebuttal E7",
+        row="CORAL, fixed as run 48 but biases at lr 1e-2 (second setting, run in parallel; choose on validation)",
+        path="rebuttal/ordinal-heads/coral_prior-init_bias-lr1e-2",
+        rebuttal="E7"
     )
 }
 
@@ -485,13 +513,15 @@ EST_MIN = {
     30: 155, 31: 155, 32: 135, 33: 135,
     34: 8, 35: 155, 36: 155, 37: 155,
     38: 65, 39: 80, 40: 65, 41: 80,
-    42: 6, 43: 10, 44: 4, 45: 4, 46: 6, 47: 6
+    42: 6, 43: 10, 44: 4, 45: 4, 46: 6, 47: 6,
+    48: 180, 49: 180
 }
 
 # Kaggle sessions for scripts/rebuttal.ipynb, longest first so the two cards finish together.
 SESSIONS = {
     "A": [30, 31, 32, 33, 27, 26, 29, 28, 43, 42, 46, 47, 45, 44, 34],
-    "B": [35, 36, 37, 39, 41, 38, 40]
+    "B": [35, 36, 37, 39, 41, 38, 40],
+    "C": [48, 49]
 }
 CHECKPOINT_RUNS = ("aux_head", "counterfactual", "ce_two_order")
 

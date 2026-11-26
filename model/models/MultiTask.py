@@ -132,7 +132,8 @@ def get_model_multi_task(
     device: torch.device,
     tokenizer: PreTrainedTokenizer,
     loss_type: str = "rank_aware",
-    class_weights: list | None = None
+    class_weights: list | None = None,
+    rank_bias_init: list | None = None
 ) -> JointClassSimBGE:
     config = AutoConfig.from_pretrained(model_name)
     config.num_labels = num_classes
@@ -147,4 +148,9 @@ def get_model_multi_task(
         model_name, config=config, ignore_mismatched_sizes=True
     )
     model.resize_token_embeddings(len(tokenizer))
+    if rank_bias_init is not None:
+        if loss_type != "coral":
+            raise ValueError("rank_bias_init applies to the CORAL head only")
+        with torch.no_grad():
+            model.rank_bias.copy_(torch.tensor(rank_bias_init, dtype=torch.float32))
     return model.to(device)

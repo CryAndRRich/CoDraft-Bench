@@ -362,6 +362,45 @@ def _speed_settings(ctx: dict, cfg: dict, model: object, collator: object, train
     return {"gradient_checkpointing": gc, "mem_probe_gb": probe}
 
 
+def _prior_rank_bias(labels: object, n_classes: int) -> list[float]:
+    """CORAL biases b_k = logit P(y > k) from the training labels: ordered, and at the start the
+    head predicts the class prior instead of a single threshold for every k."""
+    import numpy as np
+
+    y = np.asarray(labels)
+    p = np.array([(y > k).mean() for k in range(n_classes - 1)]).clip(1e-4, 1 - 1e-4)
+    return [round(float(v), 6) for v in np.log(p / (1 - p))]
+
+
+def _rank_bias_trainer(rank_bias_lr: float) -> type:
+    """Trainer whose optimizer gives the CORAL biases their own learning rate (no weight decay).
+
+    With the backbone's lr (2e-5) the four biases moved by about 0.2 in ten epochs (run 36), so
+    the thresholds stayed almost equal and classes 1 and 3 were never predicted. The schedule
+    (warmup + cosine) still applies to the bias group.
+    """
+    from transformers import Trainer
+
+    class RankBiasTrainer(Trainer):
+        def create_optimizer(self) -> object:
+            if self.optimizer is None:
+                decay = set(self.get_decay_parameter_names(self.model))
+                named = [(n, p) for n, p in self.model.named_parameters() if p.requires_grad]
+                bias = [p for n, p in named if n.endswith("rank_bias")]
+                assert len(bias) == 1, "rank_bias_lr needs exactly one CORAL bias vector"
+                rest = [(n, p) for n, p in named if not n.endswith("rank_bias")]
+                groups = [
+                    {"params": [p for n, p in rest if n in decay], "weight_decay": self.args.weight_decay},
+                    {"params": [p for n, p in rest if n not in decay], "weight_decay": 0.0},
+                    {"params": bias, "weight_decay": 0.0, "lr": rank_bias_lr}
+                ]
+                cls, kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args, self.model)
+                self.optimizer = cls(groups, **kwargs)
+            return self.optimizer
+
+    return RankBiasTrainer
+
+
 def _run_multi(ctx: dict) -> tuple:
     from transformers import DataCollatorWithPadding, Trainer, TrainingArguments
 
@@ -390,6 +429,10 @@ def _run_multi(ctx: dict) -> tuple:
     class_weights = (
         compute_class_weight(df_train["label_score"].values) if loss["loss_type"] == "ce" else None
     )
+    rank_bias_init = None
+    if spec.get("rank_bias_init") == "prior":
+        rank_bias_init = _prior_rank_bias(df_train["label_score"].values, ctx["n_classes"])
+        print("CORAL biases initialised from the training label prior:", rank_bias_init)
     model = get_model_multi_task(
         spec["model"],
         num_classes=ctx["n_classes"],
@@ -397,13 +440,15 @@ def _run_multi(ctx: dict) -> tuple:
         device=ctx["device"],
         class_weights=class_weights,
         tokenizer=tokenizer,
+        rank_bias_init=rank_bias_init,
         **loss
     )
     assert model.get_input_embeddings().num_embeddings >= len(tokenizer)
     collator = DataCollatorWithPadding(tokenizer)
     speed = _speed_settings(ctx, cfg, model, collator, train_ds)
     args = TrainingArguments(**cfg["training_args"])
-    trainer = Trainer(
+    trainer_cls = _rank_bias_trainer(spec["rank_bias_lr"]) if spec.get("rank_bias_lr") else Trainer
+    trainer = trainer_cls(
         model=model,
         args=args,
         train_dataset=train_ds,
@@ -438,6 +483,13 @@ def _run_multi(ctx: dict) -> tuple:
         "vocab_size": len(tokenizer),
         "mask_hides_heading": bool(spec.get("mask_hides_heading", False)),
         "aux_acc_test": aux_acc,
+        "rank_bias_init": rank_bias_init,
+        "rank_bias_lr": spec.get("rank_bias_lr"),
+        "rank_bias_final": (
+            [float(x) for x in trainer.model.rank_bias.detach().cpu()]
+            if hasattr(trainer.model, "rank_bias")
+            else None
+        ),
         **speed
     }
     return preds, true, df_test, save, extra, logits
